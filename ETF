@@ -1,0 +1,69 @@
+Pre‑Trade (decide if/what/how to trade)
+
+
+True price & liquidity: infer FTP (fair transfer price) per ISIN and PEX(c, size) surface from RFQ flow, inventory usage, and arrival rates (regime‑aware).
+
+
+Basis identification: size and sign ETF–NAV, CDX/futures–bond, and bond–bond RV; estimate carry/roll and funding.
+
+
+Feasibility: basket completeness and synchronization risk (correlated fill probabilities, TTL constraints, creation/redeem rules).
+
+
+Cost targets: solve tightest per‑leg cost caps that meet a required PEX threshold for the whole trade.
+
+
+Optimization: maximize expected surplus subject to PEX, DV01/CS01, concentration, balance‑sheet/funding, and client/venue constraints.
+
+
+Routing plan: pre‑select dealers/venues and RFQ sequence/sizing (what first, where, and how big), plus pre‑hedge sizing (CDX/futures) to neutralize timing risk.
+
+
+Kill/Go criteria: regime‑shift triggers, inventory overlays (internal holdings/netting), and minimum basket coverage before committing.
+
+
+
+Execution (get filled at/inside the plan)
+
+
+RFQ orchestration: price‑skew vs FTP, TTL, size slicing, parallel vs staggered blasts; venue mix (bilateral, A2A, portfolio).
+
+
+Dealer selection in‑flight: update counterparty set using live response quality/hit‑rate; adaptive price stepping to target PEX without overpaying.
+
+
+Real‑time model refresh: on regime change or adverse prints, recompute FTP/PEX and adjust quotes, caps, and hedge sizes.
+
+
+Partial‑fill control: substitutions/escalations, throttle to avoid stranded illiquid legs, hedge legging risk continuously.
+
+
+Impact & leakage: pacing, randomization, and cross‑venue coordination to minimize information footprint and mark‑outs.
+
+
+Abort/complete logic: explicit stop‑loss on execution slippage vs caps, timeouts for unsynchronized baskets, and rules to switch to create/redeem or portfolio trade.
+
+
+
+Post‑Trade (learn, price, and control)
+
+
+TCA vs plan: attribute P&L into signal (basis at FTP), execution alpha/drag (vs cost caps), impact/markup, fees/funding/settlement.
+
+
+PEX calibration: predicted vs realized reliability curves by cost level/size/venue/dealer; drift and regime segmentation.
+
+
+Model governance: parameter drift, re‑estimation cadence, feature QA/labeling from RFQ logs, and backtests with out‑of‑time checks.
+
+
+Inventory & risk: revalue at FTP (not stale composites), update DV01/CS01, liquidity add‑ons, and hedge effectiveness.
+
+
+Counterparty/venue scorecards: cost to fill, response latency, mark‑outs, leakage proxies → update routing priors.
+
+
+Ops/compliance: exception handling (NAV staleness, fails), creation/redemption reconciliation, audit‑ready RFQ/decision trails.
+
+
+These bullets map directly to build tasks: data pipelines for RFQ/quotes/fills; GLM/NB models for cost, inventory usage, arrivals; regime detection; solvers for cost‑cap/PEX‑constrained optimization; execution controllers; and TCA/calibration services.
