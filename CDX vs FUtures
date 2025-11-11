@@ -1,0 +1,149 @@
+Below is a **PEX‑driven playbook** for **Relative Value: ETF vs CDX/Futures vs Liquid‑Bond Baskets**. It mirrors your Create/Redeem checklist, but targets cash–synthetic basis trades and basket replication.
+
+---
+
+### Pre‑Trade Analytics
+
+**Signal Construction**
+
+* **ETF–CDX/Futures basis:**
+
+  * ( \Delta_{\text{ETF–CDX}} = S_{\text{ETF}}^{\text{implied}} - S_{\text{CDX}} ) (or futures‑implied spread via DV01‑matched conversion).
+  * Decompose basis into **carry/roll**, **financing/borrow**, **composition/dispersion**, **liquidity premium**.
+* **ETF–Basket basis:**
+
+  * Compute **NAV(_{\text{FTP}})** from bond‑level Fair Transfer Prices (FTP); dispersion vs ETF weights.
+  * **Tracking error** forecast from factor (OAS, DTS, sector/quality/term) and idiosyncratic residuals.
+* **Hedge Architecture Choice:**
+
+  * **CDX vs futures vs bond overlay** via expected slippage, carry, liquidity PEX, cross‑impact, and balance‑sheet usage.
+* **Liquidity Surfaces (PEX):**
+
+  * Per‑bond **PEX(_i(c))** at cost target (c) from (i) **Gamma‑GLM** cost model, (ii) **Probit** warehousing (inventory usage), (iii) **NegBin** arrival rates; aggregate to basket PEX with fill‑correlation (copula or factor) and max‑min constraints. 
+* **Market State/Regime:**
+
+  * Regime tag (z_t) from RFQ intensity/response MMPP or state filters; apply to PEX & slippage priors.
+  * Stress flags: VIX spikes, roll windows (CDX series change, futures first‑notice/last‑trade), ETF rebalance dates.
+
+**Opportunity Screening**
+
+* **Basis z‑score and confidence bands** (uses intraday microstructure vol and stale‑NAV risk).
+* **Basket feasibility:** overlap with liquid universe, **constituent executability** (PEX deciles), borrow/shortability of ETF.
+* **Inventory alignment:** internal longs/shorts to reduce cash‑leg cost; eligibility for in‑kind substitution if needed later.
+
+**Cost Targeting**
+
+* **Solve for tightest cost caps** ( {c_i^\star} ) such that **Basket‑PEX** (\ge \tau) (threshold) while maximizing expected alpha.
+* Sensitivities: (\partial \text{ES}/\partial c_i), regime shift (z_t\to z_{t+1}), roll/carry changes, borrow fee shocks.
+
+---
+
+### Trade Construction
+
+**Hedge & Sizing**
+
+* **Objective:** maximize **Expected Surplus**
+  [
+  \text{ES} = \underbrace{\beta_{\text{ETF}}\cdot\Delta_{\text{ETF–Hedge}}}_{\text{signal}}
+
+  * \underbrace{\sum_i \text{EC}*i(c_i)}*{\text{bond costs}}
+  * \underbrace{\text{Hedge slippage+carry}}_{\text{CDX/Fut}}
+  * \underbrace{\text{impact/risk capital}}*{\text{constraints}}
+    ]
+    subject to PEX(*{\text{basket}}\ge\tau), DV01/curve/sector limits, inventory bounds.
+* **Hedge mix optimizer:** choose **CDX vs futures vs cash** overlay to minimize expected hedging error for a target DV01/spread beta; include roll calendars and CTD basis (for futures).
+* **Basket selection:**
+
+  * **Greedy or MILP** to pick **k** liquid names that minimize tracking error at target DV01/OAS with **PEX‑weighted costs** and dealer coverage constraints.
+  * Add **co‑fill correlation** penalty to avoid single‑dealer or single‑sector bottlenecks.
+
+---
+
+### Execution Management
+
+**Sequencing & Locking**
+
+* **Lock basis first:** time‑priority hedge (CDX/Fut) sized to target beta; then work cash legs under cost caps.
+* **Dynamic re‑hedge:** adjust hedge size as fills arrive; maintain DV01 neutrality and minimize path P&L variance.
+
+**RFQ/Route**
+
+* **Dealer selection:** rank by **historical PEX**, hit ratios, response latency, and inventory likelihood per ISIN; diversify counterparties across correlated names.
+* **Venue choice:** bilateral RFQ vs all‑to‑all vs portfolio RFQ for correlated slices; consider ETF block prints for unwind path.
+
+**Adaptive Controls**
+
+* **Mid‑flight regime detection:** if (z_t) changes, recompute FTP/PEX/caps; widen or pause.
+* **Partial‑fill policy:** re‑optimize basket; allow ETF overlay or additional CDX micro‑hedges to cap tracking drift.
+* **Abort criteria:** basis mean‑reversion beyond stop, PEX collapse, or hedge carry flips sign.
+
+---
+
+### Post‑Trade Analytics (TCA & Calibration)
+
+**PEX Calibration**
+
+* **Reliability curves**: predicted vs realized fill by cost level/decile; **Brier / calibration** for inventory usage & arrivals.
+* **Drift detection:** parameter stability by regime, tenor, sector; retrain triggers. 
+
+**Cost Attribution**
+
+* **At‑decision FTP vs print** (price improvement/shortfall).
+* Split slippage into **dealer markup**, **market impact**, **timing**, **hedge leg slippage/carry**, **funding/fees**.
+
+**Alpha Decomposition**
+
+* **Signal alpha:** ETF–synthetic basis at FTP.
+* **Execution alpha:** inventory internalization / portfolio RFQ savings.
+* **Drag:** slippage beyond modeled (\mu_{\text{buy/sell}}), borrow costs, roll bleed.
+
+---
+
+### Risk Management
+
+**Liquidity & Inventory**
+
+* **PEX‑aware DV01/CS01 budgets**; issuer/sector caps; **concentration** and **co‑fill** risk limits.
+* **Marking:** post‑trade positions valued at **FTP**, not composites; real‑time P&L and VAR on basis risk.
+
+**Model Risk**
+
+* **Regime mis‑ID → stale FTP/PEX**; guardrails via conservative caps and fallback slippage priors.
+* **Overconfidence in PEX:** enforce realized/forecasted fill governance, shadow models, out‑of‑time tests. 
+
+**Operational**
+
+* **Roll calendars:** CDX series change / futures roll logistics.
+* **Settlement mismatch:** ETF T+2 vs cash bonds; fails/borrow contingency; ETF locate and creation fees.
+
+---
+
+### Data Pipelines & Modeling (Eng & QR Tasks)
+
+**Pipelines**
+
+* **Real‑time market data:** ETF L1/L2, CDX quotes, index rolls, futures order book, dealer RFQ stream, borrow/financing.
+* **Reference data:** ETF constituents & weights, index mappings, DV01 calculators, eligibility lists, calendars.
+* **RFQ telemetry store:** requests/responses/outcomes for PEX training.
+
+**Models**
+
+* **PEX stack:** Gamma‑GLM costs, Probit inventory usage, NegBin arrivals; per‑ISIN surfaces by size & regime. 
+* **FTP engine:** liquidity‑adjusted mid for bonds; **NAV(_{\text{FTP}})** for basket/ETF.
+* **Fill‑correlation model:** copula/factor from co‑RFQ events to get **Basket‑PEX**.
+* **Hedge slippage model:** CDX/futures microstructure (spread/queue/roll).
+
+**Optimization**
+
+* **Cost‑cap solver:** ( \min_{{c_i}} \sum_i \text{EC}*i(c_i)) s.t. PEX(*{\text{basket}}\ge \tau), tracking error (\le \epsilon).
+* **Hedge mix optimizer:** ( \min) expected hedging error + carry, with liquidity/impact penalties.
+* **Basket selector (MILP):** minimize tracking error + expected cost − PEX benefits under constraints.
+
+**Controls & Monitoring**
+
+* **Real‑time basis dashboard** with confidence bands and **go/no‑go** recommendation.
+* **Model governance:** backtests, stability plots, parameter drift, stress overlays; automated retraining when calibration degrades.
+
+---
+
+**Bottom line:** Use **liquid derivatives (CDX/futures) to lock signal**, **PEX‑driven RFQ** to decide if/when the cash legs are executable at targeted costs, and **basket optimization** to replicate exposure with the highest executable alpha‑per‑risk. The PEX framework (costs + inventory usage + arrival rates) underpins feasibility and sizing across all legs. 
