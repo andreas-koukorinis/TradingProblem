@@ -1,0 +1,29 @@
+Decision problem: For a specific bond, size, and cost target, determine execution probability within a given timeframe to optimize RFQ and trading schedules.
+
+Model problem examples: Transaction cost distribution, dealer inventory probabilities, with a GLM and probit model approach.
+
+Defining PEX integration and practical problems
+To model bond trading, I’ll use the negative binomial model for arrival rates and compute PEX as the product of arrival probabilities and cost distribution, considering warehousing rates.
+
+Practical problems to focus on include:
+
+Pre-trade: Liquidity scoring, cost targets, and RFQ planning.
+
+Execution: Venue choice, dealer selection.
+
+Post-trade: Analytics, slippage, model calibration.
+
+Risk: Impact of dealer inventory and market conditions.
+
+Data: Build enhanced TRACE pipeline, compute PEX drivers.
+
+
+So, to put it all together, the trading problem described in this paper is to build a system that can:
+
+Ingest real-time RFQ data for various bonds.
+Estimate the parameters of the MMPP model to understand the hidden liquidity regimes of the market.
+Calculate the Fair Transfer Price (FTP) for every bond in real-time based on the current estimated liquidity state.
+Act on this FTP. This becomes our new, internal "true mid-price." We use it to:
+Set Optimal Quotes: Generate our bid and ask prices to send to clients, skewed appropriately to manage risk and maximize profit.
+Value Our Inventory: Mark our own holdings to the FTP, giving us a much more accurate, real-time view of our portfolio's value and our P&L than any stale composite price could.
+Essentially, the paper provides a blueprint for turning the messy, opaque flow of client requests into a concrete, actionable pricing signal. That's the core of modern credit market making.
