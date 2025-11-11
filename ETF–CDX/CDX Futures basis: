@@ -1,0 +1,134 @@
+Pre‑Trade Analytics
+
+Signal Construction
+
+
+
+Δ
+ETF–CDX
+=
+𝑆
+ETF
+implied
+−
+𝑆
+CDX
+Δ
+ETF–CDX
+	​
+
+=S
+ETF
+implied
+	​
+
+−S
+CDX
+	​
+
+ (or futures‑implied spread via DV01‑matched conversion).
+
+Decompose basis into carry/roll, financing/borrow, composition/dispersion, liquidity premium.
+
+ETF–Basket basis:
+
+Compute NAV
+FTP
+FTP
+	​
+
+ from bond‑level Fair Transfer Prices (FTP); dispersion vs ETF weights.
+
+Tracking error forecast from factor (OAS, DTS, sector/quality/term) and idiosyncratic residuals.
+
+Hedge Architecture Choice:
+
+CDX vs futures vs bond overlay via expected slippage, carry, liquidity PEX, cross‑impact, and balance‑sheet usage.
+
+Liquidity Surfaces (PEX):
+
+Per‑bond PEX
+𝑖
+(
+𝑐
+)
+i
+	​
+
+(c) at cost target 
+𝑐
+c from (i) Gamma‑GLM cost model, (ii) Probit warehousing (inventory usage), (iii) NegBin arrival rates; aggregate to basket PEX with fill‑correlation (copula or factor) and max‑min constraints.
+
+Market State/Regime:
+
+Regime tag 
+𝑧
+𝑡
+z
+t
+	​
+
+ from RFQ intensity/response MMPP or state filters; apply to PEX & slippage priors.
+
+Stress flags: VIX spikes, roll windows (CDX series change, futures first‑notice/last‑trade), ETF rebalance dates.
+
+Opportunity Screening
+
+Basis z‑score and confidence bands (uses intraday microstructure vol and stale‑NAV risk).
+
+Basket feasibility: overlap with liquid universe, constituent executability (PEX deciles), borrow/shortability of ETF.
+
+Inventory alignment: internal longs/shorts to reduce cash‑leg cost; eligibility for in‑kind substitution if needed later.
+
+Cost Targeting
+
+Solve for tightest cost caps 
+{
+𝑐
+𝑖
+⋆
+}
+{c
+i
+⋆
+	​
+
+} such that Basket‑PEX 
+≥
+𝜏
+≥τ (threshold) while maximizing expected alpha.
+
+Sensitivities: 
+∂
+ES
+/
+∂
+𝑐
+𝑖
+∂ES/∂c
+i
+	​
+
+, regime shift 
+𝑧
+𝑡
+→
+𝑧
+𝑡
++
+1
+z
+t
+	​
+
+→z
+t+1
+	​
+
+, roll/carry changes, borrow fee shocks.
+
+Trade Construction
+
+Hedge & Sizing
+
+Objective: maximize Ex
