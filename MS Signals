@@ -1,0 +1,690 @@
+# Morgan Stanley Credit Signals Specification Document
+## Complete Requirements for Historical Signal Reproduction and Production Implementation
+
+### Version 2.0.0
+### Date: November 2024
+
+---
+
+## Executive Summary
+
+This specification provides complete requirements for reproducing Morgan Stanley's European credit research signals framework, covering fundamental metrics, valuation indicators, and portfolio analytics. The system processes raw Bloomberg/Refinitiv data to generate production-ready features for credit analysis, supporting both historical backtesting (2000-present) and live signal generation.
+
+## Table of Contents
+
+1. [Core Objectives](#core-objectives)
+2. [Universe Definition](#universe-definition)
+3. [Data Architecture](#data-architecture)
+4. [Signal Definitions](#signal-definitions)
+5. [Computation Methodology](#computation-methodology)
+6. [Quality Control](#quality-control)
+7. [Production Requirements](#production-requirements)
+8. [API Specifications](#api-specifications)
+
+---
+
+## 1. Core Objectives
+
+### Primary Goals
+- Reproduce MS European HY/IG credit fundamentals framework with >95% accuracy
+- Support real-time and historical analysis from 2000-present
+- Enable portfolio-level and single-name screening capabilities
+- Provide market-relative valuation metrics
+
+### Key Deliverables
+- 15+ fundamental signals per issuer per quarter
+- Portfolio aggregations by rating/sector/geography
+- Screening tools for relative value identification
+- Stress testing and scenario analysis capabilities
+
+---
+
+## 2. Universe Definition
+
+### Coverage Scope
+
+#### Investment Grade (IG)
+- **Ratings**: AAA to BBB- (S&P/Fitch) or Aaa to Baa3 (Moody's)
+- **Target Coverage**: ~165 European IG issuers (per MS reports)
+- **Minimum Liquidity**: €250mm outstanding debt
+
+#### High Yield (HY)
+- **Ratings**: BB+ to CCC (S&P/Fitch) or Ba1 to Caa3 (Moody's)
+- **Target Coverage**: ~200 European HY issuers
+- **Minimum Liquidity**: €100mm outstanding debt
+
+### Inclusion Criteria
+```
+1. Has public bonds OR syndicated loans outstanding
+2. Financial data available for ≥8 consecutive quarters
+3. Reporting in convertible currency (EUR, USD, GBP preferred)
+4. Not in default/restructuring (unless explicitly included)
+```
+
+### Exclusion Rules
+```
+1. Financial institutions (banks, insurance, REITs)
+   - Exception: Explicitly whitelisted financials
+2. Government-owned entities >50% state ownership
+3. Special purpose vehicles (SPVs)
+4. Project finance entities
+```
+
+### Identity Management
+
+#### Primary Identifiers
+- `issuer_id`: Internal unique identifier
+- `bloomberg_ticker`: Bloomberg composite ticker
+- `refinitiv_permid`: Refinitiv permanent ID
+- `lei_code`: Legal Entity Identifier
+
+#### Consolidation Hierarchy
+1. Ultimate parent level consolidation
+2. Guarantor-level consolidation where applicable
+3. Operating company level for holding structures
+
+---
+
+## 3. Data Architecture
+
+### Source Systems
+
+#### Bloomberg Terminal/API
+```yaml
+Primary Fields:
+  - Fundamentals: EBITDA, EBIT, Total Debt, Cash
+  - Market Data: Bond prices, CDS spreads
+  - Metadata: Ratings, sectors, geography
+  
+Update Frequency:
+  - Fundamentals: Daily check for quarterly updates
+  - Market Data: Real-time/15-minute delayed
+  - Metadata: Daily
+```
+
+#### Refinitiv Eikon/API
+```yaml
+Secondary Fields:
+  - Gap filling for Bloomberg missing data
+  - Historical fundamentals pre-2005
+  - Loan market data via LPC
+  
+Update Frequency:
+  - Batch update nightly
+```
+
+### Field Mapping Matrix
+
+| Concept | Bloomberg Fields | Refinitiv Fields | Calculation Fallback |
+|---------|-----------------|------------------|---------------------|
+| EBITDA | EBITDA, EBITDA_ADJUSTED | TR.EBITDA | EBIT + D&A |
+| Total Debt | SHORT_AND_LONG_TERM_DEBT | TR.TotalDebt | ST_Debt + LT_Debt + Leases |
+| Free Cash Flow | FREE_CASH_FLOW | TR.FreeCashFlow | CFO - Capex |
+| Interest Expense | INTEREST_EXPENSE | TR.InterestExpense | - |
+| Cash & Equivalents | CASH_AND_MARKETABLE_SECURITIES | TR.CashAndSTInvestments | Cash + ST_Investments |
+
+### Historical Data Requirements
+
+#### Minimum History
+- **Fundamentals**: 2000-present (quarterly)
+- **Market Data**: 2003-present (daily)
+- **Ratings**: 1999-present (point-in-time)
+
+#### Crisis Period Coverage
+Critical periods that MUST have complete data:
+- 2008-2009: Global Financial Crisis
+- 2011-2012: European Sovereign Crisis
+- 2020-2021: COVID-19 Impact
+
+---
+
+## 4. Signal Definitions
+
+### 4.1 Leverage Metrics
+
+#### Net Leverage
+```
+Formula: Net_Debt / EBITDA_LTM
+Where:
+  Net_Debt = Total_Debt - Cash_and_Equivalents
+  EBITDA_LTM = Sum of last 4 quarters EBITDA
+  
+Edge Cases:
+  - If EBITDA_LTM ≤ 0: Set to NULL, flag as "non-meaningful"
+  - If Net_Debt < 0: Report negative leverage (net cash position)
+```
+
+#### Gross Leverage
+```
+Formula: Total_Debt / EBITDA_LTM
+Where:
+  Total_Debt = ST_Debt + LT_Debt + Capital_Leases + Preferred_Stock(if applicable)
+  
+Options:
+  include_operating_leases: true (post-IFRS16)
+  include_pension_deficit: false (unless material)
+```
+
+### 4.2 Coverage Metrics
+
+#### Interest Coverage
+```
+Formula: EBITDA_LTM / Interest_Expense_LTM
+Where:
+  Interest_Expense_LTM = Sum of last 4 quarters interest expense
+  
+Edge Cases:
+  - If Interest_Expense_LTM ≤ 0: Set to NULL
+  - Cap at 100x for display purposes
+```
+
+#### Fixed Charge Coverage
+```
+Formula: (EBITDA_LTM - Capex_LTM) / (Interest_Expense_LTM + Scheduled_Debt_Repayments)
+```
+
+### 4.3 Liquidity Metrics
+
+#### FCF to Debt
+```
+Formula: FCF_LTM / Total_Debt
+Where:
+  FCF_LTM = CFO_LTM - Capex_LTM
+  
+Interpretation:
+  > 10%: Strong cash generation
+  5-10%: Adequate
+  < 5%: Weak/concerning
+```
+
+#### Cash to Debt
+```
+Formula: (Cash + Marketable_Securities) / Total_Debt
+
+Adjustments:
+  - Exclude restricted cash
+  - Include only securities maturing < 3 months
+```
+
+### 4.4 Growth & Momentum Metrics
+
+#### EBITDA YoY Growth
+```
+Formula: (EBITDA_LTM_current / EBITDA_LTM_prior_year) - 1
+
+Calculation:
+  - Align on fiscal quarters (Q2'23 vs Q2'22)
+  - Currency-adjusted using period-end FX
+```
+
+#### Net Debt YoY Change
+```
+Formula: Net_Debt_current - Net_Debt_prior_year
+
+Presentation:
+  - Absolute change in base currency (millions)
+  - As % of prior year debt
+```
+
+### 4.5 Valuation Metrics
+
+#### Spread per Leverage (SPL)
+```
+Formula: Credit_Spread / Net_Leverage
+
+Where:
+  Credit_Spread = Z-spread or CDS spread (bp)
+  
+Usage:
+  - Compare to historical average (10-year)
+  - Cross-sectional peer comparison
+  - Identify relative value opportunities
+```
+
+#### Spread per Volatility
+```
+Formula: Credit_Spread / Market_Volatility
+
+Where:
+  Market_Volatility = VDAX or VIX index level
+```
+
+### 4.6 Stress & Cyclicality Metrics
+
+#### Worst Historical EBITDA Decline
+```
+Calculation:
+  - Find minimum YoY % change over 10-year window
+  - Store as "max_drawdown_historical"
+  
+Usage:
+  - Cyclicality classification
+  - Stress scenario calibration
+```
+
+#### EBITDA Decline to Refinancing Threshold
+```
+Formula: Required_EBITDA_Decline = 1 - (Minimum_Coverage_EBITDA / Current_EBITDA)
+
+Where:
+  Minimum_Coverage_EBITDA = Amount needed to maintain 1.5x interest coverage
+  
+Interpretation:
+  > 50%: Strong refinancing cushion
+  25-50%: Adequate
+  < 25%: Vulnerable to downturn
+```
+
+---
+
+## 5. Computation Methodology
+
+### 5.1 LTM (Last Twelve Months) Construction
+
+#### Standard Calculation
+```python
+LTM_Metric(t) = Σ(i=0 to 3) Quarterly_Metric(t-i)
+```
+
+#### Missing Data Handling
+```yaml
+One Quarter Missing:
+  Method: Linear interpolation
+  Formula: Missing_Q = (Previous_Q + Next_Q) / 2
+  
+Two+ Quarters Missing:
+  Action: Mark LTM as invalid/NULL
+  Flag: "INSUFFICIENT_DATA"
+```
+
+#### Fiscal Year Alignment
+```yaml
+Issue: Companies report on different fiscal years
+Solution:
+  1. Map each issuer to fiscal calendar
+  2. Align quarters: "Q1" = first fiscal quarter
+  3. YoY comparisons: Always fiscal Q to fiscal Q
+```
+
+### 5.2 Currency Normalization
+
+#### Base Currency Conversion
+```yaml
+Base_Currency: EUR (configurable to USD)
+Method: Period-end spot rates
+Source: Bloomberg BGN or ECB reference rates
+
+Formula:
+  Value_EUR = Value_Local * FX_Rate(Local/EUR, period_end_date)
+```
+
+#### Historical FX Handling
+```yaml
+Pre-Euro Currencies:
+  - Use fixed conversion rates for EMU currencies
+  - DEM: 1.95583, FRF: 6.55957, ITL: 1936.27, etc.
+```
+
+### 5.3 Portfolio Aggregation
+
+#### Weighting Schemes
+
+##### Equal-Weighted
+```python
+Median_Metric = median([m1, m2, ..., mn])
+Mean_Metric = mean([m1, m2, ..., mn])
+```
+
+##### Debt-Weighted
+```python
+Weighted_Avg = Σ(Metric_i * Debt_i) / Σ(Debt_i)
+```
+
+##### Market-Cap Weighted
+```python
+Weighted_Avg = Σ(Metric_i * Market_Cap_i) / Σ(Market_Cap_i)
+```
+
+#### Percentile Distributions
+```yaml
+Calculate: [5th, 10th, 25th, 50th, 75th, 90th, 95th]
+Purpose: Identify outliers and distribution shape
+```
+
+### 5.4 Sector & Rating Aggregations
+
+#### Sector Classification
+```yaml
+Schema: GICS Level 2 with MS modifications
+Custom_Groups:
+  Cyclicals: [Autos, Chemicals, Materials, Energy]
+  Defensives: [Utilities, Telecom, Consumer Staples]
+  Mixed: [Healthcare, Industrials, Technology]
+```
+
+#### Rating Buckets
+```yaml
+Investment_Grade:
+  AAA/Aaa: [AAA, Aaa]
+  AA/Aa: [AA+, AA, AA-, Aa1, Aa2, Aa3]
+  A: [A+, A, A-, A1, A2, A3]
+  BBB/Baa: [BBB+, BBB, BBB-, Baa1, Baa2, Baa3]
+
+High_Yield:
+  BB/Ba: [BB+, BB, BB-, Ba1, Ba2, Ba3]
+  B: [B+, B, B-, B1, B2, B3]
+  CCC/Caa: [CCC+, CCC, CCC-, Caa1, Caa2, Caa3]
+```
+
+---
+
+## 6. Quality Control
+
+### 6.1 Data Validation Rules
+
+#### Fundamental Checks
+| Check | Condition | Action |
+|-------|-----------|--------|
+| Leverage Bounds | Leverage > 20x or < -5x | Flag for review |
+| Coverage Bounds | Coverage > 100x | Cap at 100x |
+| YoY Changes | \|YoY%\| > 500% | Flag as potential error |
+| Balance Sheet | Assets ≠ Liabilities + Equity (±5%) | Investigation required |
+
+#### Time Series Checks
+```yaml
+Reporting_Lag:
+  Maximum: 120 days after quarter-end
+  Action: Use previous quarter if exceeded
+  
+Continuity:
+  Check: No gaps > 2 quarters
+  Action: Interpolate or mark invalid
+```
+
+### 6.2 Cross-Validation
+
+#### Bloomberg vs Refinitiv
+```python
+if abs(Bloomberg_Value - Refinitiv_Value) / Bloomberg_Value > 0.1:
+    flag = "DATA_DISCREPANCY"
+    use_value = Bloomberg_Value  # Primary source
+    log_discrepancy()
+```
+
+#### Peer Comparison
+```yaml
+Check: Issuer metric vs sector median
+Threshold: > 3 standard deviations
+Action: Manual review required
+```
+
+### 6.3 Outlier Treatment
+
+#### Winsorization
+```yaml
+Applied_To: Ratios and growth rates
+Method: Cap at 1st and 99th percentiles
+Exclude: Absolute values (debt, EBITDA amounts)
+```
+
+#### Missing Data Protocol
+```yaml
+Random_Missing (<5%):
+  Method: Forward-fill or interpolation
+  
+Systematic_Missing (>5%):
+  Method: Exclude from aggregates
+  Flag: "INCOMPLETE_COVERAGE"
+```
+
+---
+
+## 7. Production Requirements
+
+### 7.1 Performance Specifications
+
+#### Computation Latency
+| Operation | Target | Maximum |
+|-----------|--------|---------|
+| Single issuer update | 50ms | 100ms |
+| Portfolio aggregation (500 issuers) | 2s | 5s |
+| Full universe refresh | 15min | 30min |
+| Historical backtest (10 years) | 30min | 60min |
+
+#### Throughput Requirements
+```yaml
+Concurrent_Users: 100
+Queries_Per_Second: 1000
+Data_Points_Per_Day: 10 million
+```
+
+### 7.2 Data Storage
+
+#### Database Schema
+```sql
+-- Core signals table
+CREATE TABLE fundamental_signals (
+    issuer_id VARCHAR(20),
+    report_date DATE,
+    fiscal_quarter VARCHAR(6),
+    metric_name VARCHAR(50),
+    metric_value DECIMAL(20,4),
+    currency VARCHAR(3),
+    data_quality_flag VARCHAR(20),
+    last_updated TIMESTAMP,
+    PRIMARY KEY (issuer_id, report_date, metric_name)
+);
+
+-- Aggregated metrics table
+CREATE TABLE portfolio_metrics (
+    aggregation_date DATE,
+    aggregation_type VARCHAR(20), -- 'SECTOR', 'RATING', 'UNIVERSE'
+    aggregation_key VARCHAR(50),
+    metric_name VARCHAR(50),
+    percentile_05 DECIMAL(20,4),
+    percentile_25 DECIMAL(20,4),
+    median DECIMAL(20,4),
+    percentile_75 DECIMAL(20,4),
+    percentile_95 DECIMAL(20,4),
+    debt_weighted_avg DECIMAL(20,4),
+    PRIMARY KEY (aggregation_date, aggregation_type, aggregation_key, metric_name)
+);
+```
+
+#### Caching Strategy
+```yaml
+Static_Data:
+  - Issuer metadata: 24 hours
+  - Sector mappings: Indefinite
+  
+Dynamic_Data:
+  - Fundamentals: 1 hour
+  - Market data: 15 minutes
+  - Aggregations: 30 minutes
+```
+
+### 7.3 Monitoring & Alerting
+
+#### Data Quality Monitors
+```yaml
+Missing_Data_Alert:
+  Threshold: >10% issuers missing current quarter
+  Action: Email data team, pause aggregations
+  
+Outlier_Alert:
+  Threshold: >5% of values flagged
+  Action: Manual review queue
+  
+Calculation_Error:
+  Threshold: Any divide-by-zero or NULL propagation
+  Action: Log and skip, alert if >1% affected
+```
+
+#### System Performance Monitors
+```yaml
+Latency_Monitor:
+  Measure: p50, p95, p99 response times
+  Alert: p95 > 2x target
+  
+Error_Rate:
+  Threshold: >0.1% of requests
+  Action: Page on-call engineer
+```
+
+---
+
+## 8. API Specifications
+
+### 8.1 RESTful Endpoints
+
+#### Fundamentals API
+```yaml
+GET /api/v1/fundamentals/{issuer_id}
+Parameters:
+  - date: YYYY-MM-DD (optional, default=latest)
+  - metrics: comma-separated list (optional, default=all)
+  - currency: EUR/USD/GBP (optional, default=EUR)
+Response:
+  {
+    "issuer_id": "string",
+    "report_date": "date",
+    "metrics": {
+      "net_leverage": 2.5,
+      "interest_coverage": 5.2,
+      "fcf_to_debt": 0.08
+    },
+    "metadata": {
+      "fiscal_quarter": "Q2-2023",
+      "reporting_currency": "EUR",
+      "data_quality": "COMPLETE"
+    }
+  }
+```
+
+#### Screening API
+```yaml
+POST /api/v1/screen
+Body:
+  {
+    "filters": [
+      {"field": "net_leverage", "operator": "<", "value": 3},
+      {"field": "fcf_to_debt", "operator": ">", "value": 0.05}
+    ],
+    "sort": {"field": "spread_per_leverage", "direction": "desc"},
+    "limit": 50
+  }
+Response:
+  {
+    "results": [...],
+    "total_matches": 125,
+    "execution_time_ms": 234
+  }
+```
+
+#### Time Series API
+```yaml
+GET /api/v1/timeseries/{metric}
+Parameters:
+  - issuer_id: string (optional, returns portfolio)
+  - start_date: YYYY-MM-DD
+  - end_date: YYYY-MM-DD
+  - frequency: quarterly/annual
+  - aggregation: median/mean/weighted
+Response:
+  {
+    "metric": "net_leverage",
+    "data": [
+      {"date": "2023-03-31", "value": 2.5},
+      {"date": "2023-06-30", "value": 2.3}
+    ],
+    "metadata": {
+      "aggregation_method": "median",
+      "issuer_count": 165
+    }
+  }
+```
+
+### 8.2 WebSocket Streaming
+
+#### Real-time Updates
+```yaml
+Connection: wss://api.credit-signals.com/v1/stream
+Subscribe:
+  {
+    "action": "subscribe",
+    "issuers": ["ISSUER1", "ISSUER2"],
+    "metrics": ["net_leverage", "interest_coverage"]
+  }
+Message:
+  {
+    "type": "update",
+    "issuer_id": "ISSUER1",
+    "metric": "net_leverage",
+    "value": 2.6,
+    "timestamp": "2023-11-20T14:30:00Z"
+  }
+```
+
+### 8.3 Batch Export
+
+#### Bulk Data Access
+```yaml
+POST /api/v1/export
+Body:
+  {
+    "universe": "EUROPEAN_HY",
+    "metrics": ["all"],
+    "date_range": {
+      "start": "2020-01-01",
+      "end": "2023-12-31"
+    },
+    "format": "CSV"
+  }
+Response:
+  {
+    "export_id": "uuid",
+    "status": "processing",
+    "estimated_completion": "2023-11-20T15:00:00Z",
+    "download_url": "https://..."
+  }
+```
+
+---
+
+## Appendices
+
+### A. Glossary of Terms
+
+| Term | Definition |
+|------|------------|
+| LTM | Last Twelve Months - rolling 4-quarter sum |
+| SPL | Spread Per Leverage - credit spread divided by net leverage |
+| FCF | Free Cash Flow - operating cash flow minus capital expenditures |
+| YoY | Year-over-Year - comparison to same period prior year |
+| QoQ | Quarter-over-Quarter - comparison to immediate prior quarter |
+| EBITDA | Earnings Before Interest, Tax, Depreciation & Amortization |
+| ICR | Interest Coverage Ratio - EBITDA/Interest Expense |
+| FDR | False Discovery Rate - statistical control for multiple testing |
+
+### B. Change Log
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 2.0.0 | 2024-11 | Complete rewrite with all MS methodology |
+| 1.0.0 | 2024-10 | Initial specification |
+
+### C. References
+
+1. Morgan Stanley Credit Strategy Research (2011): "Single-name screens across fundamentals and valuations"
+2. Morgan Stanley Credit Strategy Research (2011): "Sensitivity of EBITDA to growth"
+3. Morgan Stanley Credit Strategy Research (2011): "Screen for positive FCF strong liquidity and low cyclicality"
+4. Morgan Stanley Credit Strategy Research (2011): "Cyclicality vs. Liquidity"
+
+---
+
+## Contact Information
+
+**Product Owner**: Credit Quant Research Team
+**Technical Contact**: TBD
+**Documentation**: https://internal.docs/credit-signals
+**Support**: credit-signals-support@company.com
