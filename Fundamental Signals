@@ -1,0 +1,469 @@
+fundamental_signals_spec:
+  version: "1.0.0"
+  owner:
+    team: "Credit Quant Research"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+  description: >
+    Specification for computing high-yield corporate fundamental signals
+    (net leverage, gross leverage, EBITDA YoY, net debt YoY, FCF-to-debt,
+    interest coverage, cash-to-debt, capex-to-depreciation) from raw
+    Bloomberg/Refinitiv fundamentals. Designed to reproduce MS-style
+    European HY strategy charts and tables and to support ongoing
+    production of these signals and reports.
+
+  universe_definition:
+    scope: "Global Corporate High Yield (initially European HY)"
+    inclusion_rules:
+      - issuer has public debt or loans outstanding
+      - rating in [BB, B, CCC] at any point in sample OR appears in legacy HY indices
+      - sufficient financial history (>= 8 consecutive quarterly reports)
+    exclusion_rules:
+      - financials and banks (unless explicitly whitelisted)
+      - structured products, SPVs with non-operating assets
+    identity_keys:
+      primary_key: "issuer_id"
+      secondary_keys:
+        - "bloomberg_ticker"
+        - "refinitiv_perm_id"
+        - "isin_list"
+        - "country_of_risk"
+        - "rating_history"
+
+  calendars:
+    reporting_frequency: "Quarterly"
+    ltm_window_quarters: 4
+    yoy_lag_quarters: 4
+    alignment_policy: >
+      Align YoY comparisons on fiscal-quarter basis (e.g. 2Q23 vs 2Q22),
+      not calendar-year end, using each issuer's reported period end dates.
+
+  data_sources:
+    fundamentals:
+      primary: "Bloomberg"
+      secondary: "Refinitiv"
+      retrieval_mode: "API + nightly batch export"
+      vendor_field_mapping:
+        # Conceptual names -> vendor-specific fields (examples; to be concretised)
+        EBITDA_q:
+          bloomberg: "EBITDA_QTY"
+          refinitiv: "EBITDA(QTR)"
+        Depreciation_q:
+          bloomberg: "DEP_AMORT_QTY"
+          refinitiv: "DEP_AMORT(QTR)"
+        InterestExpense_q:
+          bloomberg: "INT_EXP_NET_QTY"
+          refinitiv: "INTEXP_NET(QTR)"
+        CFO_q:
+          bloomberg: "NCF_OP_ACT_QTY"
+          refinitiv: "NCF_OPER(QTR)"
+        Capex_q:
+          bloomberg: "CAPEX_QTY"
+          refinitiv: "CAPEX(QTR)"
+        ST_Debt_t:
+          bloomberg: "ST_BORROWINGS"
+          refinitiv: "ST_DEBT(TMRW)"
+        LT_Debt_t:
+          bloomberg: "LT_DEBT"
+          refinitiv: "LT_BORROW"
+        LeaseLiabilities_t:
+          bloomberg: "LEASE_LIAB"
+          refinitiv: "LEASE_LIAB"
+        Cash_t:
+          bloomberg: "CASH_AND_EQUIV"
+          refinitiv: "CASH_EQUIV"
+        MarketableSecurities_t:
+          bloomberg: "ST_INVESTMENTS"
+          refinitiv: "ST_INVEST"
+    fx_rates:
+      provider: "Bloomberg"
+      usage: "Convert all monetary items to base currency (EUR or USD) at period-end FX."
+    metadata:
+      fields:
+        - "country_of_risk"
+        - "sector"
+        - "rating_current"
+        - "rating_history"
+        - "currency_reporting"
+      usage: "Aggregation by rating bucket, geography and sector."
+
+  preprocessing:
+    currency_normalisation:
+      base_currency: "EUR"
+      method: "Translate reported values at period-end FX into base currency."
+      exceptions: "None; all issuers translated for cross-sectional comparability."
+    units:
+      policy: "Store all monetary fields in millions of base currency."
+    ltm_construction:
+      applicable_to:
+        - EBITDA_q
+        - Depreciation_q
+        - InterestExpense_q
+        - CFO_q
+        - Capex_q
+      formula: |
+        X_LTM(t) = sum_{k=0..3} X_q(t - k)
+      requirements:
+        min_quarters: 4
+        missing_quarter_handling: "If 1 quarter missing, allow linear interpolation; if >=2, mark LTM as invalid."
+    gross_debt_definition:
+      formula: |
+        GrossDebt(t) = ST_Debt_t + LT_Debt_t + LeaseLiabilities_t
+      options:
+        include_leases: true
+        include_pref_shares: false
+    cash_like_definition:
+      formula: |
+        CashLike(t) = Cash_t + MarketableSecurities_t
+      note: >
+        MarketableSecurities_t should capture highly liquid ST instruments
+        (<= 3 months) that are effectively cash substitutes.
+    net_debt_definition:
+      formula: |
+        NetDebt(t) = GrossDebt(t) - CashLike(t)
+
+  metrics:
+    - id: "gross_leverage"
+      name: "Gross Leverage (Debt / LTM EBITDA)"
+      description: >
+        Measures issuer leverage using total debt before netting cash.
+        Expressed in turns (x). Used in leverage charts and by-rating
+        breakdowns.
+      inputs:
+        - GrossDebt_t
+        - EBITDA_LTM_t
+      computation:
+        steps:
+          - name: "Compute GrossDebt_t"
+            formula: "GrossDebt(t) = ST_Debt_t + LT_Debt_t + LeaseLiabilities_t"
+          - name: "Compute EBITDA_LTM_t"
+            formula: "EBITDA_LTM(t) = sum_{k=0..3} EBITDA_q(t-k)"
+          - name: "Compute GrossLeverage_t"
+            formula: "GrossLeverage(t) = GrossDebt(t) / EBITDA_LTM(t)"
+      output:
+        type: "float"
+        unit: "x"
+        rounding: 2
+      edge_cases:
+        - condition: "EBITDA_LTM(t) <= 0"
+          action: "set metric to null; flag issuer as 'non-meaningful leverage'"
+        - condition: "GrossDebt(t) <= 0"
+          action: "set metric to 0.0"
+      aggregation:
+        level_metrics:
+          - "issuer"
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+            weight: "equal"
+          - name: "debt_weighted_average"
+            method: "weighted_mean"
+            weight_field: "GrossDebt_t"
+
+    - id: "net_leverage"
+      name: "Net Leverage (Net Debt / LTM EBITDA)"
+      description: "Leverage net of cash and cash-like assets, in turns (x)."
+      inputs:
+        - NetDebt_t
+        - EBITDA_LTM_t
+      computation:
+        steps:
+          - name: "Compute NetDebt_t"
+            formula: "NetDebt(t) = GrossDebt(t) - CashLike(t)"
+          - name: "Compute EBITDA_LTM_t"
+            formula: "EBITDA_LTM(t) = sum_{k=0..3} EBITDA_q(t-k)"
+          - name: "Compute NetLeverage_t"
+            formula: "NetLeverage(t) = NetDebt(t) / EBITDA_LTM(t)"
+      output:
+        type: "float"
+        unit: "x"
+        rounding: 2
+      edge_cases:
+        - condition: "EBITDA_LTM(t) <= 0"
+          action: "set metric to null; flag issuer as 'non-meaningful leverage'"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+          - name: "by_rating_bucket"
+            method: "median"
+            group_by: "rating_current"
+          - name: "by_country"
+            method: "median"
+            group_by: "country_of_risk"
+
+    - id: "ebitda_yoy_growth"
+      name: "EBITDA LTM YoY Growth"
+      description: >
+        Year-on-year growth rate of LTM EBITDA, computed vs the same
+        fiscal quarter one year earlier. Expressed as a percentage.
+      inputs:
+        - EBITDA_LTM_t
+        - EBITDA_LTM_t_minus_4
+      computation:
+        steps:
+          - name: "Compute EBITDA_LTM_t"
+            formula: "EBITDA_LTM(t) = sum_{k=0..3} EBITDA_q(t-k)"
+          - name: "Compute prior LTM"
+            formula: "EBITDA_LTM(t-4) = sum_{k=4..7} EBITDA_q(t-k)"
+          - name: "YoY growth"
+            formula: "EBITDA_YoY(t) = EBITDA_LTM(t) / EBITDA_LTM(t-4) - 1"
+      output:
+        type: "float"
+        unit: "ratio"
+        representation: "percentage"
+        rounding: 1
+      edge_cases:
+        - condition: "EBITDA_LTM(t-4) <= 0"
+          action: "set metric to null; flag as 'YoY undefined due to base <= 0'"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+
+    - id: "net_debt_yoy_change"
+      name: "Net Debt YoY Change"
+      description: >
+        Year-on-year change in net debt, both absolute and percentage,
+        versus the same fiscal quarter one year earlier.
+      inputs:
+        - NetDebt_t
+        - NetDebt_t_minus_4
+      computation:
+        steps:
+          - name: "Compute NetDebt_t"
+            formula: "NetDebt(t) = GrossDebt(t) - CashLike(t)"
+          - name: "Compute NetDebt_t_minus_4"
+            formula: "NetDebt(t-4) from stored history"
+          - name: "Absolute change"
+            formula: "DeltaNetDebt(t) = NetDebt(t) - NetDebt(t-4)"
+          - name: "Percent change"
+            formula: "NetDebt_YoY(t) = DeltaNetDebt(t) / NetDebt(t-4)"
+      output:
+        fields:
+          absolute_change:
+            type: "float"
+            unit: "base_currency_mn"
+            rounding: 1
+          pct_change:
+            type: "float"
+            unit: "ratio"
+            representation: "percentage"
+            rounding: 1
+      edge_cases:
+        - condition: "abs(NetDebt(t-4)) < 1e-6"
+          action: "set pct_change to null; keep absolute_change"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_pct_change_by_universe"
+            method: "median"
+            field: "pct_change"
+
+    - id: "fcf_to_debt"
+      name: "FCF to Debt"
+      description: >
+        Free cash flow over the last twelve months divided by total debt.
+        Used as a liquidity / de-leveraging measure. Expressed as a
+        percentage.
+      inputs:
+        - CFO_LTM_t
+        - Capex_LTM_t
+        - DebtForFCF_t
+      computation:
+        steps:
+          - name: "Compute CFO_LTM_t"
+            formula: "CFO_LTM(t) = sum_{k=0..3} CFO_q(t-k)"
+          - name: "Compute Capex_LTM_t"
+            formula: "Capex_LTM(t) = sum_{k=0..3} Capex_q(t-k)"
+          - name: "Free cash flow"
+            formula: "FCF_LTM(t) = CFO_LTM(t) - Capex_LTM(t)"
+          - name: "Debt base"
+            formula: "DebtForFCF(t) = GrossDebt(t)"
+          - name: "FCF to debt ratio"
+            formula: "FCF_to_Debt(t) = FCF_LTM(t) / DebtForFCF(t)"
+      output:
+        type: "float"
+        unit: "ratio"
+        representation: "percentage"
+        rounding: 1
+      edge_cases:
+        - condition: "DebtForFCF(t) <= 0"
+          action: "set metric to null; flag as 'no debt base'"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+          - name: "by_country"
+            method: "median"
+            group_by: "country_of_risk"
+
+    - id: "interest_coverage"
+      name: "Interest Coverage (EBITDA / Interest Expense)"
+      description: >
+        LTM EBITDA divided by LTM net interest expense. Expressed in x.
+        Primary solvency and margin-of-safety indicator.
+      inputs:
+        - EBITDA_LTM_t
+        - InterestExpense_LTM_t
+      computation:
+        steps:
+          - name: "Compute EBITDA_LTM_t"
+            formula: "EBITDA_LTM(t) = sum_{k=0..3} EBITDA_q(t-k)"
+          - name: "Compute InterestExpense_LTM_t"
+            formula: "InterestExpense_LTM(t) = sum_{k=0..3} InterestExpense_q(t-k)"
+          - name: "Coverage"
+            formula: "InterestCoverage(t) = EBITDA_LTM(t) / InterestExpense_LTM(t)"
+      output:
+        type: "float"
+        unit: "x"
+        rounding: 1
+      edge_cases:
+        - condition: "InterestExpense_LTM(t) <= 0"
+          action: "set metric to null; flag as 'coverage undefined due to non-positive interest'"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+          - name: "by_rating_bucket"
+            method: "median"
+            group_by: "rating_current"
+
+    - id: "cash_to_debt"
+      name: "Cash to Debt"
+      description: >
+        Cash and cash-like instruments as a fraction of total gross debt.
+        Expressed as a percentage.
+      inputs:
+        - CashLike_t
+        - GrossDebt_t
+      computation:
+        steps:
+          - name: "Compute CashLike_t"
+            formula: "CashLike(t) = Cash_t + MarketableSecurities_t"
+          - name: "Compute GrossDebt_t"
+            formula: "GrossDebt(t) = ST_Debt_t + LT_Debt_t + LeaseLiabilities_t"
+          - name: "Ratio"
+            formula: "CashToDebt(t) = CashLike(t) / GrossDebt(t)"
+      output:
+        type: "float"
+        unit: "ratio"
+        representation: "percentage"
+        rounding: 1
+      edge_cases:
+        - condition: "GrossDebt(t) <= 0"
+          action: "set metric to null; flag as 'no debt'"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+
+    - id: "capex_to_depreciation"
+      name: "Capex to Depreciation"
+      description: >
+        LTM capex divided by LTM depreciation and amortisation. Values
+        <1 indicate shrinking or under-invested asset base; >1 indicate
+        expansion. Expressed in x.
+      inputs:
+        - Capex_LTM_t
+        - Depreciation_LTM_t
+      computation:
+        steps:
+          - name: "Compute Capex_LTM_t"
+            formula: "Capex_LTM(t) = sum_{k=0..3} Capex_q(t-k)"
+          - name: "Compute Depreciation_LTM_t"
+            formula: "Depreciation_LTM(t) = sum_{k=0..3} Depreciation_q(t-k)"
+          - name: "Capex / Depreciation"
+            formula: "CapexToDep(t) = Capex_LTM(t) / Depreciation_LTM(t)"
+      output:
+        type: "float"
+        unit: "x"
+        rounding: 2
+      edge_cases:
+        - condition: "Depreciation_LTM(t) <= 0"
+          action: "set metric to null; flag as 'asset-light or missing dep data'"
+      aggregation:
+        portfolio_aggregations:
+          - name: "median_by_universe"
+            method: "median"
+
+  reporting:
+    standard_charts:
+      - id: "hy_gross_net_leverage_time_series"
+        metrics:
+          - "gross_leverage"
+          - "net_leverage"
+        aggregation: "median_by_universe"
+        frequency: "quarterly"
+      - id: "hy_fcf_and_coverage_time_series"
+        metrics:
+          - "fcf_to_debt"
+          - "interest_coverage"
+        aggregation: "median_by_universe"
+        frequency: "quarterly"
+      - id: "hy_capex_vs_depreciation"
+        metrics:
+          - "capex_to_depreciation"
+        aggregation: "median_by_universe"
+        frequency: "quarterly"
+      - id: "hy_by_rating_and_country_cross_section"
+        metrics:
+          - "net_leverage"
+          - "fcf_to_debt"
+          - "interest_coverage"
+        aggregation: "by_rating_bucket / by_country"
+        frequency: "quarterly"
+
+  quality_controls:
+    schema_validation:
+      - check: "all required fields present per issuer-quarter"
+      - check: "data types correct (float vs string)"
+    accounting_consistency:
+      - check: "EBITDA_LTM(t) non-negative for majority of issuers"
+      - check: "NetDebt(t) ≈ GrossDebt(t) - CashLike(t) within tolerance"
+    outlier_detection:
+      method: "MAD-based winsorisation at 5-sigma for metrics used in portfolio medians"
+    reconciliation:
+      - check: "Aggregate HY medians historically reproduce within +/- 5% of reference MS series where available."
+      - schedule: "Quarterly manual review"
+
+  sla:
+    refresh_frequency: "Daily (business days)"
+    data_cutoff_time: "T+1 06:00 local exchange time"
+    pipeline_completion_target: "T+1 08:00 Europe/London"
+    availability_target:
+      monthly_uptime: ">= 99.0%"
+      max_outage_duration_hours: 4
+    data_lag_limits:
+      fundamentals:
+        normal_conditions: "Newly published company report ingested within 24h of vendor availability."
+        peak_season: "Within 48h during earnings peaks."
+    backfill_policy:
+      description: >
+        When vendor restatements or historical corrections arrive, recompute
+        all derived metrics for affected issuers from the earliest impacted
+        period to present. Maintain versioned history of metric values.
+      allowed_window_years: 10
+    incident_management:
+      severity_levels:
+        - sev1: "System-wide failure or stale data > 3 business days."
+        - sev2: "Incorrect metrics for major HY index constituents."
+        - sev3: "Isolated issuer-level issues."
+      oncall_ownership: "Credit Quant Engineering"
+      notification_channels:
+        - "email: credit-quants@domain"
+        - "slack: #credit-signals-alerts"
+
+  audit_and_lineage:
+    lineage_tracking:
+      enabled: true
+      granularity: "issuer-quarter-metric"
+      stored_metadata:
+        - "source_vendor"
+        - "source_timestamp"
+        - "raw_values_used"
+        - "pipeline_version"
+    reproducibility:
+      requirement: >
+        Given a snapshot of raw vendor exports, FX rates and this YAML
+        spec (including version), the full time series of derived metrics
+        must be reproducible bit-for-bit.
