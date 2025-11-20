@@ -1,0 +1,190 @@
+pain_monitor_spec:
+  version: "1.1.0"
+  owner:
+    team: "Credit Quant Research"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+
+  description: >
+    Extension of the Pain Monitor spec for corporate bonds with aggregation
+    by sector, rating bucket, and duration bucket.
+
+  instruments_scope:
+    asset_classes: ["corporate_bonds"]
+    universe_definition:
+      min_history_days: 120
+      required_fields:
+        - "price"
+        - "volume"
+        - "side"
+        - "open_interest"
+        - "sector"
+        - "rating"
+        - "modified_duration"
+    grouping_dimensions:
+      sector:
+        source_field: "sector_raw"
+        mapping: "ref_sector_map"   # mapping table: issuer/ISIN -> standardized sector
+        examples: ["Energy", "Financials", "Industrials", "Utilities", "TMT", "Other"]
+      rating_bucket:
+        source_field: "rating_raw"
+        mapping: "ref_rating_bucket_map"
+        buckets:
+          - name: "IG_AAA_A"
+            ratings: ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-"]
+          - name: "IG_BBB"
+            ratings: ["BBB+", "BBB", "BBB-"]
+          - name: "HY_BB"
+            ratings: ["BB+", "BB", "BB-"]
+          - name: "HY_B"
+            ratings: ["B+", "B", "B-"]
+          - name: "HY_CCC_and_below"
+            ratings: ["CCC+", "CCC", "CCC-", "CC", "C", "D"]
+      duration_bucket:
+        source_field: "modified_duration"
+        buckets:
+          - name: "short"
+            range: [0.0, 3.0]    # years
+          - name: "intermediate"
+            range: (3.0, 7.0]
+          - name: "long"
+            range: (7.0, 30.0]
+
+  methodology:
+    note_on_bonds_aggregation: >
+      Cohort and pain logic remains defined at the instrument (bond) level.
+      Sector/rating/duration views are computed by aggregating bond-level
+      cohorts and pain across all bonds belonging to a given (sector,
+      rating_bucket, duration_bucket) group for each date.
+
+    aggregation_levels:
+      - name: "instrument_level"
+        key: ["trade_date", "ticker"]
+        description: "Base cohort and pain computation per bond."
+      - name: "sector_level"
+        key: ["trade_date", "sector"]
+        aggregation: "sum over all tickers mapped to sector."
+      - name: "sector_rating_duration_level"
+        key: ["trade_date", "sector", "rating_bucket", "duration_bucket"]
+        aggregation: "sum over all tickers in this (sector, rating_bucket, duration_bucket)."
+
+  data_inputs:
+    raw_flows:
+      add_fields:
+        - name: "isin"
+          description: "Optional; cross-reference to issuer and sector maps."
+        - name: "sector_raw"
+          description: "Raw sector classification from source (e.g. GICS/BICS)."
+        - name: "rating_raw"
+          description: "Latest composite rating."
+        - name: "modified_duration"
+          description: "EOD modified duration (in years)."
+    reference_data:
+      tables:
+        - name: "ref_sector_map"
+          keys: ["isin", "ticker"]
+          fields:
+            - "sector_standard": "canonical sector label"
+        - name: "ref_rating_bucket_map"
+          keys: ["rating_raw"]
+          fields:
+            - "rating_bucket": "mapped rating bucket label"
+
+  data_schemas:
+    raw_flows_table:
+      name: "bond_trade_flows_by_price"
+      primary_key: ["trade_date", "ticker", "price_bucket"]
+      fields:
+        - { name: "trade_date", type: "DATE" }
+        - { name: "ticker", type: "STRING" }
+        - { name: "isin", type: "STRING" }
+        - { name: "price_bucket", type: "DECIMAL(10,4)" }
+        - { name: "long_initiated", type: "INT" }
+        - { name: "long_liquidated", type: "INT" }
+        - { name: "short_initiated", type: "INT" }
+        - { name: "short_liquidated", type: "INT" }
+        - { name: "oi_eod", type: "INT" }
+        - { name: "sector", type: "STRING" }          # standardized via ref_sector_map
+        - { name: "rating_bucket", type: "STRING" }   # via ref_rating_bucket_map
+        - { name: "duration_bucket", type: "STRING" } # computed from modified_duration
+        - { name: "close_price", type: "DECIMAL(10,4)" }
+        - { name: "ingestion_ts", type: "TIMESTAMP" }
+
+    cohort_positions_table:
+      name: "bond_cohort_positions"
+      primary_key: ["trade_date", "ticker", "price_bucket"]
+      fields:
+        - { name: "trade_date", type: "DATE" }
+        - { name: "ticker", type: "STRING" }
+        - { name: "price_bucket", type: "DECIMAL(10,4)" }
+        - { name: "long_outstanding", type: "INT" }
+        - { name: "short_outstanding", type: "INT" }
+        - { name: "sector", type: "STRING" }
+        - { name: "rating_bucket", type: "STRING" }
+        - { name: "duration_bucket", type: "STRING" }
+        - { name: "last_update_ts", type: "TIMESTAMP" }
+
+    pain_monitor_table_instrument:
+      name: "bond_pain_monitor"
+      primary_key: ["trade_date", "ticker"]
+      fields:
+        - { name: "trade_date", type: "DATE" }
+        - { name: "ticker", type: "STRING" }
+        - { name: "sector", type: "STRING" }
+        - { name: "rating_bucket", type: "STRING" }
+        - { name: "duration_bucket", type: "STRING" }
+        - { name: "total_pain", type: "FLOAT" }
+        - { name: "pain_long_total", type: "FLOAT" }
+        - { name: "pain_short_total", type: "FLOAT" }
+        - { name: "oi_eod", type: "INT" }
+        - { name: "close_price", type: "DECIMAL(10,4)" }
+        - { name: "run_id", type: "STRING" }
+
+    pain_monitor_table_agg:
+      name: "bond_pain_monitor_agg"
+      primary_key: ["trade_date", "sector", "rating_bucket", "duration_bucket"]
+      fields:
+        - { name: "trade_date", type: "DATE" }
+        - { name: "sector", type: "STRING" }
+        - { name: "rating_bucket", type: "STRING" }
+        - { name: "duration_bucket", type: "STRING" }
+        - { name: "total_pain", type: "FLOAT", description: "Sum over all bonds in group." }
+        - { name: "pain_long_total", type: "FLOAT" }
+        - { name: "pain_short_total", type: "FLOAT" }
+        - { name: "total_oi", type: "INT", description: "Sum of oi_eod across group." }
+        - { name: "num_bonds", type: "INT", description: "Count of unique tickers in group." }
+        - { name: "run_id", type: "STRING" }
+
+  daily_process:
+    sector_rating_duration_rollups:
+      description: >
+        After computing instrument-level cohorts and pain, aggregate results across
+        sector, rating_bucket, and duration_bucket to produce sector/rating/duration
+        views.
+      steps:
+        - "1. Run the standard instrument-level daily_process as previously defined."
+        - "2. Enrich instrument-level outputs with sector, rating_bucket, duration_bucket."
+        - "3. For each (trade_date, sector, rating_bucket, duration_bucket), compute:"
+        - "   - total_pain = Σ total_pain[ticker]"
+        - "   - pain_long_total = Σ pain_long_total[ticker]"
+        - "   - pain_short_total = Σ pain_short_total[ticker]"
+        - "   - total_oi = Σ oi_eod[ticker]"
+        - "   - num_bonds = count_distinct(ticker)."
+        - "4. Persist into bond_pain_monitor_agg."
+
+  interfaces:
+    api:
+      adds:
+        - name: "get_pain_by_sector(date, sector)"
+          returns: "Aggregate pain metrics across all bonds in sector."
+        - name: "get_pain_by_sector_rating_duration(date, sector, rating_bucket, duration_bucket)"
+          returns: "Aggregate pain metrics for the specific group."
+        - name: "get_sector_heatmap(date)"
+          returns: "Matrix of (sector × rating_bucket × duration_bucket) with total_pain and total_oi."
+
+  data_quality_checks:
+    cross_level_consistency:
+      rule: >
+        Sum of total_pain at instrument level for a given (date, sector, rating_bucket, duration_bucket)
+        must equal total_pain in bond_pain_monitor_agg for that group within a small numerical tolerance.
+      action_on_fail: "Log discrepancy, flag group, do not overwrite previous good aggregate snapshot."
