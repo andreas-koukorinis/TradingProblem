@@ -1,0 +1,327 @@
+spec_version: "2.0.0"
+product_name: "Corporate Credit & Sovereign Duration Analytics Platform"
+owner:
+  research_owner: "Credit & Macro Quant Research"
+  engineering_owner: "Research Technology"
+  governance_contact: "Risk Analytics Oversight"
+
+description: >
+  This YAML specification defines the full set of derived metrics,
+  transformations, indicators, data sources, methodological steps,
+  and SLAs required to reproduce:
+    (1) Corporate credit fundamentals-based metrics (net leverage,
+        EBITDA YoY, interest coverage, etc.) extracted from equity
+        and credit-linked issuer data.
+    (2) Morgan Stanley–style liquidity vs cyclicality screens and
+        underperformer diagnostics.
+    (3) The Morgan Stanley Bond Market Indicator suite (carry,
+        momentum, equity signal, business cycle surprise).
+  The models must operate across both historical datasets and
+  live, production data, producing high-quality time series aligned
+  with methodology disclosed in: 
+    - High Yield: Looking for the Best in Stress (2011)
+    - High Yield: Pricing Tomorrow’s Deleveraging Today (2011)
+    - Our Bond Market Indicators (2015).
+
+###############################################################################
+# 1. DATA UNIVERSES
+###############################################################################
+
+universe:
+  corporate_issuers:
+    description: "High Yield corporate issuers (European by default)."
+    inclusion_rules:
+      - issuer has publicly reported quarterly financials
+      - issuer has rated or previously rated HY debt (BB/B/CCC)
+      - issuer appears historically in HY indices or Morgan Stanley HY universe
+    exclusion_rules:
+      - banks, insurers, NBFIs (unless explicitly whitelisted)
+      - sovereigns, quasi-sovereigns
+    identifiers:
+      - issuer_id
+      - bloomberg_ticker
+      - refinitiv_perm_id
+      - LEI
+      - ISIN_list
+
+  sovereign_markets:
+    description: "Markets used in Bond Market Indicators (MS BMI 2015)."
+    markets: ["UST", "Bund", "Gilt", "JGB"]
+    identifiers:
+      - 10y_benchmark_ticker
+      - currency
+      - futures_contract
+
+###############################################################################
+# 2. DATA SOURCES & RAW INPUT FIELDS
+###############################################################################
+
+data_sources:
+  fundamentals:
+    provider_primary: "Bloomberg"
+    provider_secondary: "Refinitiv"
+    retrieval_frequency: "Daily"
+    required_raw_fields:
+      EBITDA_q: { bb: "EBITDA", ref: "EBITDA(QTR)" }
+      Dep_q: { bb: "DEP_AMORT", ref: "DA(QTR)" }
+      InterestExp_q: { bb: "INT_EXP", ref: "INTEXP(QTR)" }
+      CFO_q: { bb: "CASH_FROM_OPER", ref: "NCF_OPER(QTR)" }
+      Capex_q: { bb: "CAPEX", ref: "CAPEX(QTR)" }
+      ST_Debt: { bb: "SHORT_AND_CURRENT_DEBT", ref: "ST_DEBT" }
+      LT_Debt: { bb: "LONG_TERM_DEBT", ref: "LT_DEBT" }
+      LeaseLiabilities: { bb: "LEASE_LIAB", ref: "LEASE_LIAB" }
+      Cash: { bb: "CASH_EQUIV", ref: "CASH_EQUIV" }
+      MarketableSecs: { bb: "ST_INVEST", ref: "ST_INVEST" }
+
+  market_data:
+    provider: "Bloomberg"
+    required_fields:
+      - daily_bond_prices
+      - daily_yields
+      - daily_spreads
+      - CDS_5y_mid
+      - iBoxx HY spreads
+      - iTraxx Main & XOver
+      - FX_rates
+      - equity_indices (S&P, EuroStoxx, Nikkei)
+      - EM_equity_basket
+      - DM_equity_basket
+      - 2s10s curve for carry indicator
+      - Business cycle indicators with consensus & surprise
+
+###############################################################################
+# 3. PRE-PROCESSING (GLOBAL)
+###############################################################################
+
+preprocessing:
+  currency_normalization:
+    base_currency: "EUR"
+    method: "Translate data using period-end FX"
+  
+  units:
+    monetary_unit: "Millions (base currency)"
+
+  ltm_calculation:
+    window_quarters: 4
+    formula: "LTM_X(t) = sum(X_q(t-k) for k in [0..3])"
+    missing_quarter_policy: "Allow interpolation for one missing quarter; invalidate for >=2."
+
+  debt_constructors:
+    GrossDebt: "ST_Debt + LT_Debt + LeaseLiabilities"
+    CashLike: "Cash + MarketableSecs"
+    NetDebt: "GrossDebt - CashLike"
+
+###############################################################################
+# 4. CORPORATE FUNDAMENTALS METRICS
+###############################################################################
+
+fundamentals_metrics:
+
+  gross_leverage:
+    formula: "GrossDebt(t) / EBITDA_LTM(t)"
+    output_unit: "x"
+    edge_cases:
+      - EBITDA_LTM <= 0 → null
+
+  net_leverage:
+    formula: "NetDebt(t) / EBITDA_LTM(t)"
+    output_unit: "x"
+
+  ebitda_yoy:
+    formula: "EBITDA_LTM(t) / EBITDA_LTM(t-4) - 1"
+    output_unit: "%"
+    edge_cases:
+      - EBITDA_LTM(t-4) <= 0 → null
+
+  net_debt_yoy:
+    absolute_change: "NetDebt(t) - NetDebt(t-4)"
+    percent_change: "(NetDebt(t) - NetDebt(t-4)) / NetDebt(t-4)"
+    output_unit: "%"    
+
+  fcf_to_debt:
+    FCF_LTM: "CFO_LTM - Capex_LTM"
+    ratio: "FCF_LTM / GrossDebt"
+    output_unit: "%"
+
+  interest_coverage:
+    formula: "EBITDA_LTM(t) / InterestExp_LTM(t)"
+    output_unit: "x"
+    edge_cases:
+      - InterestExp_LTM <= 0 → null
+
+  cash_to_debt:
+    formula: "CashLike / GrossDebt"
+    output_unit: "%"
+
+  capex_to_depreciation:
+    formula: "Capex_LTM / Dep_LTM"
+    output_unit: "x"
+
+###############################################################################
+# 5. CORPORATE LIQUIDITY VS CYCLICALITY (MS 2011 MODEL)
+###############################################################################
+
+liquidity_vs_cyclicality:
+  worst_yoy_ebitda_decline:
+    lookback_years: 10
+    formula: "min( (EBITDA_LTM(t_i)/EBITDA_LTM(t_i-4) - 1) ) over 10Y"
+    interpretation: "Higher positive → less cyclical; large negatives → more cyclical."
+
+  liquidity_stress_test:
+    inputs:
+      - CashLike
+      - FCF_LTM
+      - Maturities_through_2013 (or rolling +2y)
+    steps:
+      - Check if FCF burn fully depletes cash within 2 years.
+      - Check if liquidity covers bond & loan maturities.
+      - Haircut EBITDA by scenarios {0%, -10%, -20%, ... -100%} to determine when refinancing is forced.
+    output: "Required cumulative EBITDA decline to trigger refinancing need."
+
+###############################################################################
+# 6. SOVEREIGN BOND MARKET INDICATORS (MS BMI 2015)
+###############################################################################
+
+bond_market_indicators:
+
+  carry_indicator:
+    description: >
+      Volatility-adjusted term premium carry, consistent with
+      MS Bond Market Indicators (2015).
+    inputs:
+      - 2s10s_slope
+      - 1y_realized_vol
+    formula: "zscore(2s10s_slope / vol)"
+    normalization: "Map to range [-10, +10] using CDF."
+
+  momentum_indicator:
+    description: "Bond excess return trend (4-month EMA)."
+    inputs:
+      - ExcessReturnIndex
+    formula:
+      momentum_raw: "ERI(t-1) - EMA_4m(ERI)"
+      vol_adjustment: "momentum_raw / EMA_4m(|ΔERI|)"
+    normalization: "Scale to [-10, +10]"
+
+  equity_indicator:
+    description: "Risk-aversion proxy based on equity performance."
+    inputs:
+      - 3m_local_equity_return
+      - 3m_EM_minus_DM_equity_spread
+    formula: "average(z(local_3m), z(EM-DM_3m))"
+    normalization: "Scale to [-10, +10]"
+
+  business_cycle_indicator:
+    description: "Business cycle surprise signal."
+    inputs:
+      - Surprise(actual - consensus) for PMIs, ISM, IFO, NFP, Retail Sales
+    composite_surprise: "weighted average of standardized surprises"
+    normalization: "Map to [-10, +10]"
+
+  combined_signal:
+    formula: "mean(carry, momentum, equity, business_cycle)"
+    neutralization_band: [-1.5, +1.5]
+    apply_neutral_zero_if_in_band: true
+
+  overall_signal_crossmarket_restriction:
+    rule: >
+      Overall sovereign signal can be non-zero ONLY if at least one other
+      market has the same directional combined signal (long/short).
+    output_scale: [-10, +10] with neutral represented as 0.0
+
+###############################################################################
+# 7. HISTORICAL & LIVE METHODOLOGY
+###############################################################################
+
+methodology:
+  historical_reconstruction:
+    required_history:
+      fundamentals: "From 2000 onward"
+      sovereign_markets: "From 1992 onward"
+      equity_data: "From 1992 onward"
+      surprises_data: "Ideally 2000 onward"
+    backfilling:
+      interpolation_rules:
+        - "No synthetic EBITDA series allowed"
+        - "No forward-fill for more than 1 quarter"
+    point_in_time_rules:
+      - "Use filing date as availability date"
+      - "Market / macro data must use timestamp-aligned closing values"
+
+  live_production:
+    intraday_cutoff: "22:00 UTC for previous day"
+    vendor_refresh:
+      Bloomberg: "06:00 UTC"
+      Refinitiv: "04:00 UTC"
+    recomputation_schedule:
+      fundamentals: "Daily at 08:00 UTC"
+      sovereign_indicators: "Daily at 07:00 UTC"
+    model_freeze_policy:
+      - "If incomplete macro data for business cycle surprise, freeze prior value."
+
+###############################################################################
+# 8. LINEAGE, AUDIT & VERSIONING
+###############################################################################
+
+lineage:
+  store_raw_inputs: true
+  store_intermediate_fields: true
+  store_final_metrics: true
+  metadata:
+    - pipeline_version
+    - vendor_timestamp
+    - FX_rate_used
+    - revision_log
+    - issuer_reporting_date
+    - data_quality_score
+
+versioning:
+  policy: "Every metric derivation change increments minor version."
+  archive:
+    location: "s3://credit-research/historical-versions/"
+    retention: "10 years"
+
+###############################################################################
+# 9. SLA REQUIREMENTS
+###############################################################################
+
+SLA:
+  data_availability:
+    fundamentals: ">= 99% monthly uptime"
+    market_data: ">= 99.5% daily availability"
+  pipeline_completion:
+    daily_deadline: "09:00 UTC"
+    max_lag:
+      fundamentals: "24 hours after vendor availability"
+      macro_surprises: "60 minutes after release"
+  acceptable_latency:
+    credit_metrics_refresh: "Daily"
+    sovereign_indicators_refresh: "Daily"
+  incident_response:
+    sev1:
+      condition: "Pipeline down or stale > 48 hours"
+      response_time: "2 hours"
+    sev2:
+      condition: "Incorrect values for >5% issuers"
+      response_time: "6 hours"
+    sev3:
+      condition: "Isolated issuer issues"
+      response_time: "72 hours"
+
+###############################################################################
+# 10. OUTPUT API / DELIVERY
+###############################################################################
+
+outputs:
+  formats: ["Parquet", "CSV", "Arrow", "REST API JSON"]
+  endpoints:
+    /fundamentals/latest:
+      returns: "All credit fundamental metrics for last quarter-end"
+    /liquidity_cyclicality/latest:
+      returns: "Computed liquidity stress + cyclicality map"
+    /sovereign_indicators/daily:
+      returns: "Carry, momentum, equity, business surprise, combined, overall"
+  reporting_frequency:
+    dashboards: "Daily"
+    attribution_reports: "Weekly"
+    universe_rolls: "Quarterly"
