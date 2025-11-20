@@ -1,0 +1,390 @@
+bond_market_indicators_spec:
+  version: "1.0.0"
+  name: "Morgan-Stanley-Style Bond Market Indicators (BMI)"
+  description: >
+    Specification to compute Bond Market Indicators for sovereign 10Y
+    benchmarks (UST, Bund, Gilt, JGB) using four systematic factors:
+    volatility-adjusted carry, bond momentum, equity performance, and
+    business-cycle surprises. Factors are combined into a single
+    weekly/ daily duration signal on a scale [-10, +10], with
+    cross-market consistency constraints, as described in Morgan
+    Stanley’s 2015 Bond Market Indicators note. :contentReference[oaicite:0]{index=0}
+
+  ####################################################################
+  # 1. UNIVERSE
+  ####################################################################
+  universe:
+    markets:
+      - id: "UST"
+        name: "US Treasuries"
+        ten_year_benchmark: "On-the-run 10Y UST"
+        currency: "USD"
+      - id: "DBR"
+        name: "German Bunds"
+        ten_year_benchmark: "10Y DBR benchmark"
+        currency: "EUR"
+      - id: "UKT"
+        name: "UK Gilts"
+        ten_year_benchmark: "10Y Gilt benchmark"
+        currency: "GBP"
+      - id: "JGB"
+        name: "Japanese Government Bonds"
+        ten_year_benchmark: "10Y JGB benchmark"
+        currency: "JPY"
+
+  ####################################################################
+  # 2. DATA SOURCES
+  ####################################################################
+  data_sources:
+    sovereign_bonds:
+      provider: "Bloomberg (primary), Refinitiv (secondary)"
+      required_fields:
+        - "10Y_yield_daily_close"
+        - "2Y_yield_daily_close"
+        - "10Y_price_total_return_index (incl. coupons)"
+        - "risk_free_short_rate (cash return for excess-return calc)"
+    volatility:
+      provider: "Internal calc from 10Y daily yield or TR index"
+      definition: >
+        1-year realized volatility of daily excess returns or
+        yield changes, using exponential weights (half-life ~60d).
+    equity_markets:
+      provider: "Bloomberg / Refinitiv"
+      required_fields:
+        - "Local_main_equity_index (e.g. SPX, DAX, FTSE, NKY)"
+        - "Global_EM_equity_index (e.g. MSCI EM)"
+        - "Global_DM_equity_index (e.g. MSCI World or MSCI DM)"
+    macro_surprises:
+      provider: "Bloomberg ECOS / proprietary surprise DB"
+      required_series_by_market:
+        UST:
+          - "US ISM Manufacturing PMI"
+          - "US Nonfarm Payrolls"
+          - "US Retail Sales"
+          - "US Industrial Production"
+        DBR:
+          - "Eurozone Composite PMI / IFO"
+          - "Eurozone Industrial Production"
+          - "Eurozone Retail Sales"
+        UKT:
+          - "UK PMI (Composite / Manufacturing)"
+          - "UK Industrial Production"
+          - "UK Retail Sales"
+        JGB:
+          - "Japan Tankan / PMI"
+          - "Japan Industrial Production"
+          - "Japan Retail Sales"
+      required_fields_per_release:
+        - "actual"
+        - "median_consensus"
+        - "release_timestamp"
+    calendars:
+      trading_days: "TARGET calendar + local market holidays"
+      frequency:
+        backtest_signal: "Weekly (Thursday EOD snapshot)"
+        live_signal: "Daily (close-of-business snapshot)"
+
+  ####################################################################
+  # 3. PRE-PROCESSING
+  ####################################################################
+  preprocessing:
+    excess_return_index:
+      description: >
+        Index of excess returns over cash for a constant-duration
+        synthetic 10Y position in each market.
+      steps:
+        - compute_daily_excess_return:
+            formula: >
+              ER_t = PriceTR_10Y_t / PriceTR_10Y_{t-1}
+                     - (1 + r_cash_t)   # or log equivalent
+        - cumulate:
+            formula: "ERI_t = ERI_{t-1} * (1 + ER_t)"
+            base_value: 100.0
+    realized_volatility:
+      horizon: "252 trading days (1Y)"
+      type: "EWMA"
+      formula: >
+        vol_t = sqrt( λ * vol_{t-1}^2 + (1-λ) * (ΔY_t)^2 )
+        where λ ≈ 0.94 and ΔY_t is daily change in 10Y yield
+        or excess return; annualise with sqrt(252).
+    z_score:
+      description: "Standardisation over full available sample."
+      formula: "z_t = (x_t - mean(x)) / std(x)"
+      use_cases:
+        - "carry_signal_raw"
+        - "equity_signal_components (3m returns, EM-DM spread)"
+    lookbacks:
+      three_month_window: "63 trading days"
+      four_month_window: "84 trading days"
+
+  ####################################################################
+  # 4. FACTOR DEFINITIONS
+  ####################################################################
+  factors:
+
+    ##################################################################
+    # 4.1 Volatility-Adjusted Carry
+    ##################################################################
+    carry:
+      description: >
+        Volatility-adjusted term-premium carry: steepness of the
+        2s10s curve divided by 1Y realized volatility, then
+        standardized and mapped to [-10,10]. :contentReference[oaicite:1]{index=1}
+      inputs:
+        - "2Y_yield_daily_close"
+        - "10Y_yield_daily_close"
+        - "1Y_realized_volatility (10Y yield or excess returns)"
+      raw_computation:
+        slope_2s10s: "s_t = Y10_t - Y2_t"
+        vol_adjusted: "c_raw_t = s_t / vol_t"
+      standardisation:
+        method: "full-sample z-score"
+        formula: "c_z_t = (c_raw_t - mean(c_raw)) / std(c_raw)"
+      normalization:
+        method: "Gaussian CDF to score"
+        mapping: >
+          score_carry_t = 20 * Φ(c_z_t) - 10
+          # Φ is standard normal CDF; score ∈ [-10, +10]
+      signal:
+        interpretation:
+          positive: "Steep curve, high carry → long duration bias"
+          negative: "Flat/inverted curve, low carry → short/neutral"
+
+    ##################################################################
+    # 4.2 Bond Market Momentum
+    ##################################################################
+    momentum:
+      description: >
+        Trend-following signal based on a 4-month exponential
+        moving average of the excess-return index, scaled by
+        recent volatility and mapped to [-10,10]. :contentReference[oaicite:2]{index=2}
+      inputs:
+        - "ExcessReturnIndex (ERI_t)"
+      raw_computation:
+        ema_window: "approx. 4 months (84 trading days)"
+        ema_formula: "EMA_t = α * ERI_t + (1-α) * EMA_{t-1}"
+        alpha: "2 / (N+1) where N ≈ 84"
+        momentum_raw: "m_raw_t = ERI_{t-1} - EMA_{t-1}"
+        vol_scale: "v_mom_t = EMA_4m( |ΔERI| )"
+        standardized_ratio: "m_std_t = m_raw_t / v_mom_t"
+      normalization:
+        method: "vol-target scaling then clipping to [-10,10]"
+        steps:
+          - scale_to_target_vol:
+              target_std: 1.0
+              formula: "m_scaled_t = m_std_t * (1 / std(m_std))"
+          - clip:
+              min: -10
+              max: 10
+        score_momentum_t: "m_scaled_t (after clipping)"
+      signal:
+        interpretation:
+          positive: "Recent trend up in ERI → long duration"
+          negative: "Recent trend down → short duration"
+
+    ##################################################################
+    # 4.3 Equity Market Performance
+    ##################################################################
+    equity:
+      description: >
+        Risk-aversion proxy: when 3-month equity performance
+        (local and EM-DM spread) is weak, expect higher bond
+        excess returns (long duration). When strong, expect lower
+        bond returns (short/neutral). :contentReference[oaicite:3]{index=3}
+      inputs:
+        - "Local_equity_index_price"
+        - "Global_EM_equity_index_price"
+        - "Global_DM_equity_index_price"
+      raw_computation:
+        local_3m_return: "R_loc_t = P_loc_t / P_loc_{t-63} - 1"
+        em_3m_return: "R_EM_t = P_EM_t / P_EM_{t-63} - 1"
+        dm_3m_return: "R_DM_t = P_DM_t / P_DM_{t-63} - 1"
+        em_dm_spread: "S_EMDM_t = R_EM_t - R_DM_t"
+      z_scores:
+        z_loc: "z_loc_t = zscore(R_loc_t)"
+        z_spread: "z_spread_t = zscore(S_EMDM_t)"
+        combined_raw: "e_raw_t = 0.5 * (z_loc_t + z_spread_t)"
+      normalization:
+        mapping: "score_equity_t = 20 * Φ(-e_raw_t) - 10"
+        note: >
+          Negative equity surprises (bad returns) → positive score
+          (long duration). The minus sign in Φ(-e_raw_t) flips the
+          direction so bad equities → high positive bond score.
+      signal:
+        interpretation:
+          positive: "Recent equity weakness / EM underperformance → long duration"
+          negative: "Equity strength / EM outperformance → short/neutral"
+
+    ##################################################################
+    # 4.4 Business Cycle Surprise
+    ##################################################################
+    business_cycle:
+      description: >
+        Composite surprise index from key business-cycle
+        indicators: actual minus consensus, standardized and
+        aggregated. Negative surprise (weaker activity) → long
+        duration; positive surprise → short duration. :contentReference[oaicite:4]{index=4}
+      inputs:
+        - "Macro releases with actual and consensus"
+      per_release_surprise:
+        formula: "s_i_t = (actual_i_t - consensus_i_t) / σ_i"
+        note: "σ_i is historical std of (actual-consensus) for series i."
+      composite_index:
+        formula: >
+          BC_raw_t = Σ_i w_i * s_i_t
+          where Σ_i w_i = 1 and w_i are fixed heuristic weights
+          by indicator importance (e.g. PMI, payrolls, IP, retail).
+      normalization:
+        mapping: "score_bc_t = 20 * Φ(-BC_raw_t) - 10"
+        note: "Negative macro surprises → positive score (long duration)."
+      signal:
+        interpretation:
+          positive: "Activity disappointing → long duration"
+          negative: "Activity surprising to upside → short duration"
+
+  ####################################################################
+  # 5. NORMALISATION & COMBINED SIGNAL
+  ####################################################################
+  scoring:
+    score_range: [-10, 10]
+    combined_signal:
+      description: >
+        Simple equal-weight average of the four factor scores
+        for each market.
+      formula: >
+        combined_t = (score_carry_t + score_momentum_t
+                      + score_equity_t + score_bc_t) / 4
+      neutral_band:
+        lower: -1.5
+        upper: 1.5
+        rule: "If combined_t ∈ [lower, upper], set combined_t = 0.0"
+      capping_per_factor:
+        rule: "Each factor score is already capped in [-10,10]; no further cap."
+
+  ####################################################################
+  # 6. OVERALL SIGNAL (CROSS-MARKET RESTRICTION)
+  ####################################################################
+  overall_signal:
+    description: >
+      Apply cross-market consistency restriction: a market’s
+      overall signal can only be non-zero if at least one other
+      market has combined signal with the same sign; else set
+      to zero. :contentReference[oaicite:5]{index=5}
+    rule:
+      - for_each_market_m:
+          sign_m: "sgn(combined_t(m))"
+          if_absent_or_zero: "overall_t(m) = 0.0"
+          else:
+            condition: "exists market n ≠ m such that sgn(combined_t(n)) = sign_m"
+            if_true: "overall_t(m) = combined_t(m)"
+            if_false: "overall_t(m) = 0.0"
+
+  ####################################################################
+  # 7. CROSS-MARKET SIGNALS
+  ####################################################################
+  cross_market_signals:
+    description: >
+      Relative-duration signals between markets, used for
+      spread/ RV trades (e.g. long UST vs short Bund). :contentReference[oaicite:6]{index=6}
+    definition:
+      formula: "signal_{A/B}(t) = overall_t(A) - overall_t(B)"
+      constraint: >
+        At least one of overall_t(A), overall_t(B) must be non-zero.
+    examples:
+      - "DBR/UST"
+      - "DBR/UKT"
+      - "UST/JGB"
+      - "UKT/JGB"
+
+  ####################################################################
+  # 8. METHODOLOGY: HISTORICAL & LIVE
+  ####################################################################
+  methodology:
+    horizon:
+      tactical_view: "1–2 months"
+      trade_holding_period: "6–10 weeks average"
+    historical_backtest:
+      start_date: "1992-01-01"
+      sample_for_stats: "1993 onward (out-of-sample setup)"
+      signal_frequency: "Weekly"
+      weekly_timing:
+        compute_on: "Thursday close"
+        trade_on: "Friday open / early session"
+        holding_period: "1 week in backtest (but signal persistence ~6–10 weeks)"
+      point_in_time_requirements:
+        - "Use only data available as of computation date."
+        - "Macro surprises use first release figures, not revisions."
+    live_production:
+      daily_schedule:
+        snapshot_time: "End-of-day local market"
+        processing_time: "T+1 06:00 UTC"
+        publish_time: "T+1 07:00 UTC"
+      weekly_view:
+        official_scorecard_day: "Friday (using Thursday close data)"
+      failover_policy:
+        - "If equity or macro data missing for last few days, carry and momentum still updated; equity/business-cycle factor scores frozen at last available."
+
+  ####################################################################
+  # 9. SLA & QUALITY
+  ####################################################################
+  SLA:
+    availability:
+      indicator_timeseries: ">= 99.5% monthly availability"
+    freshness:
+      daily_signals_published_by: "T+1 07:00 UTC"
+      macro_surprise_integrated_within: "60 minutes after release where relevant"
+    accuracy:
+      tolerance_vs_reference_backtest: "Annualised Sharpe ratio within ±0.1 and hit-ratio within ±2% vs validated reference backtest."
+    incident_handling:
+      sev1:
+        condition: "No overall signals for any market for >2 business days"
+        response_time: "2 hours"
+      sev2:
+        condition: "Carry or momentum factor not updated for >2 business days"
+        response_time: "8 hours"
+      sev3:
+        condition: "Isolated missing macro or equity data affecting one factor"
+        response_time: "24 hours"
+
+  quality_control:
+    checks:
+      - name: "Score range check"
+        rule: "All factor scores and combined/overall signals ∈ [-10,10]"
+      - name: "Monotonic mapping sanity"
+        rule: >
+          Higher 2s10s slopes should correspond to higher carry scores
+          in long-run sample (positive rank correlation > 0.6).
+      - name: "Direction check – equity vs bonds"
+        rule: >
+          Over long history, weeks with worst 20% equity returns should
+          have higher average BMI overall signal than best 20% equity weeks.
+      - name: "Backtest replication"
+        rule: >
+          Reproduce key summary stats (Sharpe, hit ratio, long bias) within
+          tolerances vs reference paper tables.
+
+  ####################################################################
+  # 10. OUTPUT FORMAT
+  ####################################################################
+  outputs:
+    daily_table:
+      keys:
+        - "date"
+        - "market_id"
+      fields:
+        - "score_carry"
+        - "score_momentum"
+        - "score_equity"
+        - "score_business_cycle"
+        - "score_combined"
+        - "score_overall"
+    weekly_scorecard:
+      description: "Human-readable table similar to Exhibit 1 in MS note."
+      fields:
+        - "market_id"
+        - "score_carry"
+        - "score_momentum"
+        - "score_equity"
+        - "score_business_cycle"
+        - "score_combined"
+        - "score_overall"
