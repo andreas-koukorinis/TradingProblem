@@ -1,0 +1,315 @@
+pain_monitor_spec:
+  version: "1.0.0"
+  owner:
+    team: "Credit Quant Research"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+
+  description: >
+    Unified methodology to reconstruct bond positioning by entry price and compute a
+    stable Pain Monitor. Combines flow-at-price (daily initiations/liquidations) with
+    cohort accounting constrained by open interest (OI) and FIFO rules.
+
+  instruments_scope:
+    asset_classes: ["corporate_bonds", "rates_futures", "credit_indices", "bond_ETFs"]
+    universe_definition:
+      # instrument-specific filters are to be configured externally
+      min_history_days: 120
+      required_fields: ["price", "volume", "side", "open_interest"]
+
+  methodology:
+    layers:
+      - name: "flow_layer"
+        purpose: >
+          Capture daily trading activity at each price bucket: longs/shorts initiated
+          and liquidated. Pure flow view, used as input to cohort accounting.
+        outputs:
+          - long_initiated[t][p]
+          - long_liquidated[t][p]
+          - short_initiated[t][p]
+          - short_liquidated[t][p]
+
+      - name: "cohort_layer"
+        purpose: >
+          Track surviving positions by entry price bucket using initiations, price-local
+          liquidations, and OI-driven FIFO liquidation. Produces outstanding long and short
+          cohorts at each entry price.
+        outputs:
+          - cohort_long[t][p]
+          - cohort_short[t][p]
+
+      - name: "pain_layer"
+        purpose: >
+          Compute mark-to-market pain for each cohort given current close price, and
+          aggregate to a single Pain Monitor metric per instrument per day.
+        outputs:
+          - pain_long[t][p]
+          - pain_short[t][p]
+          - total_pain[t]
+
+    conventions:
+      price_bucket:
+        definition: "Uniform price grid per instrument (e.g. 0.5 or 1.0 price units)."
+        constraints:
+          - "Bucket mapping must be stable through time for each instrument."
+          - "Close price is mapped to nearest bucket for cohort PnL evaluation."
+
+  data_inputs:
+    raw_flows:
+      source: "TRACE / RFQ logs / exchange tape / internal trade capture"
+      frequency: "daily_EOD (intraday optional)"
+      per_instrument_fields:
+        - trade_date: "ISO date"
+        - ticker: "string instrument identifier"
+        - price_bucket: "decimal, bucketed trade price"
+        - long_initiated: "int, volume of new long positions opened at this price"
+        - long_liquidated: "int, volume of existing long positions closed at this price"
+        - short_initiated: "int, volume of new short positions opened at this price"
+        - short_liquidated: "int, volume of existing short positions closed at this price"
+        - oi_eod: "int, open interest at end of day for the instrument (not per price)"
+    market_data:
+      fields:
+        - close_price: "EOD mid/close used for PnL"
+        - currency: "instrument currency"
+      requirements:
+        - "One close_price per instrument per trade_date."
+
+  state_variables:
+    description: >
+      Cohort state is the persistent book of surviving positions by entry price at the
+      end of each day. It is the only state that must be carried across dates.
+    fields:
+      - cohort_long[t][p]: "non-negative int, surviving long units entered at price_bucket p"
+      - cohort_short[t][p]: "non-negative int, surviving short units entered at price_bucket p"
+    initialization:
+      rule: "For first available trade_date, initialize all cohorts to zero."
+
+  daily_process:
+    description: >
+      Deterministic end-of-day update to transform flows and previous-day cohorts into
+      new cohorts and Pain Monitor metrics.
+    order_of_steps:
+      - "1. Load yesterday's cohort_long and cohort_short for the instrument."
+      - "2. Load today's flow data per price_bucket and oi_eod."
+      - "3. Apply price-local initiations."
+      - "4. Apply price-local liquidations."
+      - "5. Compute ΔOI and apply FIFO liquidation if ΔOI < 0."
+      - "6. Enforce non-negativity and OI consistency checks."
+      - "7. Compute pain per bucket and aggregate Pain Monitor metrics."
+      - "8. Persist today's cohorts and Pain Monitor outputs."
+
+    step_3_apply_initiations:
+      formulae:
+        long: "cohort_long[p]  = cohort_long[p]  + long_initiated[t][p]"
+        short: "cohort_short[p] = cohort_short[p] + short_initiated[t][p]"
+
+    step_4_apply_price_local_liquidations:
+      logic: >
+        Liquidations at a price p first reduce cohorts at the same p (price-local matching).
+        This preserves the interpretation of price-level trading activity and avoids
+        spurious cohort changes at other prices.
+      formulae:
+        long_local_liq: "local_long_liq[p]  = min(cohort_long[p],  long_liquidated[t][p])"
+        short_local_liq: "local_short_liq[p] = min(cohort_short[p], short_liquidated[t][p])"
+        update_long: "cohort_long[p]  = cohort_long[p]  - local_long_liq[p]"
+        update_short: "cohort_short[p] = cohort_short[p] - local_short_liq[p]"
+      note: >
+        Any remaining liquidation beyond local cohorts is treated as flow churn and not
+        applied to cohorts unless required by the OI constraint in Step 5.
+
+    step_5_apply_oi_driven_fifo_liquidation:
+      oi_definitions:
+        oi_today: "oi_eod[t]"
+        oi_yesterday: "oi_eod[t-1]"
+        delta_oi: "ΔOI_t = oi_today - oi_yesterday"
+      rule: >
+        If ΔOI_t < 0, some net positions have exited the market and cohorts must be
+        reduced accordingly. Liquidate from oldest cohorts first (FIFO) across price
+        buckets until total reduction equals -ΔOI_t. If ΔOI_t ≥ 0, no additional
+        cohort liquidation occurs.
+      fifo_long:
+        required_liq_long: >
+          RequiredLongLiq = max( -ΔOI_t_long_component, 0 ).
+          If no long/short decomposition is available, apply ΔOI_t to net long cohort.
+        procedure: >
+          Iterate price buckets in ascending order of entry date (oldest cohorts first).
+          At each bucket p:
+            liq = min(cohort_long[p], RemainingRequiredLongLiq)
+            cohort_long[p] = cohort_long[p] - liq
+            RemainingRequiredLongLiq = RemainingRequiredLongLiq - liq
+          Stop when RemainingRequiredLongLiq = 0 or all long cohorts are depleted.
+      fifo_short:
+        required_liq_short: >
+          Optional, if short-side open interest is tracked separately. Same FIFO logic
+          as longs applied to cohort_short.
+
+    step_6_safety_and_consistency:
+      non_negativity:
+        rule: "For all p: cohort_long[p] = max(cohort_long[p], 0); cohort_short[p] = max(cohort_short[p], 0)."
+      oi_consistency_check:
+        rule: >
+          Sum of all outstanding cohorts (long - short, or long-only depending on OI
+          definition) should approximately match oi_eod[t], allowing for rounding and
+          data-quality tolerances.
+        alert_thresholds:
+          - "Relative difference > 5% triggers a warning."
+          - "Relative difference > 10% triggers a hard error and QA review."
+
+  pain_calculation:
+    definitions:
+      close_price_today: "P_t"
+      entry_price_bucket: "p"
+    per_bucket:
+      pain_long[p]: "cohort_long[p]  * max(entry_price_bucket - P_t, 0)"
+      pain_short[p]: "cohort_short[p] * max(P_t - entry_price_bucket, 0)"
+      interpretation: >
+        Pain is positive when the cohort is underwater relative to its entry price.
+        Long cohorts are in pain when entry_price > current_price.
+        Short cohorts are in pain when entry_price < current_price.
+    aggregation:
+      pain_long_total: "sum_p(pain_long[p])"
+      pain_short_total: "sum_p(pain_short[p])"
+      total_pain: "pain_long_total + pain_short_total"
+    outputs:
+      - "Cohort-level pain by price bucket."
+      - "Instrument-level total_pain time series."
+      - "Optional normalized metrics (e.g. pain per unit OI, pain as % notional)."
+
+  data_schemas:
+    raw_flows_table:
+      name: "trade_flows_by_price"
+      primary_key: ["trade_date", "ticker", "price_bucket"]
+      fields:
+        - name: "trade_date"
+          type: "DATE"
+          description: "Trading day (EOD)."
+        - name: "ticker"
+          type: "STRING"
+          description: "Instrument identifier."
+        - name: "price_bucket"
+          type: "DECIMAL(10,4)"
+          description: "Bucketed trade price."
+        - name: "long_initiated"
+          type: "INT"
+          description: "New long positions opened at this price."
+        - name: "long_liquidated"
+          type: "INT"
+          description: "Existing long positions closed at this price."
+        - name: "short_initiated"
+          type: "INT"
+          description: "New short positions opened at this price."
+        - name: "short_liquidated"
+          type: "INT"
+          description: "Existing short positions closed at this price."
+        - name: "oi_eod"
+          type: "INT"
+          description: "Instrument-level open interest at end of day."
+        - name: "ingestion_ts"
+          type: "TIMESTAMP"
+          description: "Ingestion timestamp for pipeline auditing."
+
+    cohort_positions_table:
+      name: "cohort_positions"
+      primary_key: ["trade_date", "ticker", "price_bucket"]
+      fields:
+        - name: "trade_date"
+          type: "DATE"
+          description: "End-of-day snapshot date."
+        - name: "ticker"
+          type: "STRING"
+          description: "Instrument identifier."
+        - name: "price_bucket"
+          type: "DECIMAL(10,4)"
+          description: "Cohort entry price."
+        - name: "long_outstanding"
+          type: "INT"
+          description: "Surviving long cohort size at this entry price."
+        - name: "short_outstanding"
+          type: "INT"
+          description: "Surviving short cohort size at this entry price."
+        - name: "last_update_ts"
+          type: "TIMESTAMP"
+          description: "Last pipeline update timestamp."
+
+    pain_monitor_table:
+      name: "pain_monitor"
+      primary_key: ["trade_date", "ticker"]
+      fields:
+        - name: "trade_date"
+          type: "DATE"
+          description: "End-of-day date."
+        - name: "ticker"
+          type: "STRING"
+          description: "Instrument identifier."
+        - name: "total_pain"
+          type: "FLOAT"
+          description: "Total pain across long and short cohorts."
+        - name: "pain_long_total"
+          type: "FLOAT"
+          description: "Aggregate pain from long cohorts."
+        - name: "pain_short_total"
+          type: "FLOAT"
+          description: "Aggregate pain from short cohorts."
+        - name: "price_bucket"
+          type: "DECIMAL(10,4)"
+          description: "Optional: cohort-level breakdown row."
+        - name: "pain_at_bucket"
+          type: "FLOAT"
+          description: "Optional: pain contribution from this cohort."
+        - name: "close_price"
+          type: "DECIMAL(10,4)"
+          description: "EOD close price used for PnL."
+        - name: "oi_eod"
+          type: "INT"
+          description: "Open interest used in this computation."
+        - name: "run_id"
+          type: "STRING"
+          description: "Pipeline run identifier for reproducibility."
+
+  product_spec:
+    purpose: >
+      Provide a stable, interpretable measure of where the market is positioned by
+      entry price and how much PnL pressure (pain) exists in the surviving cohorts.
+      Used for RFQ pricing, ETF arbitrage, dealer routing, and risk management.
+    users:
+      - "Credit Quant Researchers"
+      - "Systematic Traders"
+      - "Execution and Liquidity Management"
+    outputs:
+      core:
+        - "Daily cohort heatmap (long_outstanding, short_outstanding by price_bucket)."
+        - "Daily Pain Monitor time series per instrument."
+      derived:
+        - "Pain-based flow predictors."
+        - "Stress indicators (e.g. high pain concentration near recent highs/lows)."
+    slas:
+      daily_eod_refresh:
+        deadline_local: "07:00 America/New_York"
+        days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+      intraday_refresh:
+        enabled: false
+        note: "Configurable; if enabled, recommend 15-minute or 60-minute cadence."
+    data_quality_checks:
+      - name: "oi_consistency_check"
+        rule: "Sum of cohorts must be within 5% of oi_eod."
+        action_on_fail: "Log warning, flag instrument for QA review."
+      - name: "non_negativity"
+        rule: "All cohorts long_outstanding, short_outstanding must be >= 0."
+        action_on_fail: "Set negatives to zero, log error, investigate upstream data."
+      - name: "missing_close_price"
+        rule: "No pain calculation without close_price."
+        action_on_fail: "Skip instrument, log and alert."
+    interfaces:
+      api:
+        - "get_position_cohorts(ticker, date): returns cohort_long, cohort_short by price_bucket."
+        - "get_pain_monitor(ticker, date): returns total_pain, pain_long_total, pain_short_total."
+        - "get_position_heatmap(ticker, date): returns full price_bucket grid with cohorts and pain."
+      storage_formats:
+        - "SQL (cohort_positions, pain_monitor tables)."
+        - "Parquet/Delta for batch analytics."
+        - "Polars/Pandas ready DataFrames in research environment."
+    versioning:
+      spec_id: "pain_monitor_spec_v1.0.0"
+      change_control:
+        - "Any change to cohort logic or OI handling requires version bump."
+        - "All changes must be documented with before/after validation on reference instruments."
