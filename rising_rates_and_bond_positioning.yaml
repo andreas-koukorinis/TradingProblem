@@ -1,0 +1,291 @@
+
+rising_rates_and_bond_positioning_spec:
+  version: "1.0.0"
+  owner:
+    team: "Global Rates & Positioning"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+  description: >
+    Specification for computing bond positioning indicators and technical
+    risk metrics used in the Rising Rates and Bond Positioning reports:
+    CTA exposure, risk parity betas, speculative futures positioning, pension
+    demand estimates, foreign flows, and bond fund flows.
+
+  universe_definition:
+    scope: "UST, Bund, global govies, futures and credit"
+    inclusion_rules:
+      - "Include major G10 sovereign futures and cash curves."
+      - "Include key credit fund and ETF flow aggregates."
+      - "Include US pension & foreign flow aggregates where data exists."
+    identity_keys:
+      country_code: "ISO_2"
+      asset_type:
+        - "govt_fut"
+        - "govt_cash"
+        - "credit_fund"
+        - "mm_fund"
+      cftc_contract_code: "string"
+
+  data_sources:
+    cftc_futures:
+      provider: "CFTC"
+      fields:
+        net_noncommercial:
+          description: "Net non-commercial positions (long-short) in contracts"
+        net_leveraged:
+          description: "Net positions for leveraged funds"
+        net_asset_manager:
+          description: "Net positions for asset managers"
+        open_interest:
+          description: "Total open interest"
+    epfr_flows:
+      provider: "EPFR"
+      fields:
+        bond_funds:
+          description: "Weekly flows into bond mutual funds & ETFs"
+        equity_funds:
+          description: "Weekly flows into equity funds"
+        region_buckets:
+          - "US"
+          - "Europe"
+          - "EM"
+    risk_parity_indices:
+      provider: "Bloomberg/Proprietary"
+      fields:
+        rp_total_return:
+          description: "Risk parity composite total return index"
+        rp_beta_to_bonds:
+          description: "Estimated beta of RP fund to bond index"
+        rp_beta_to_equity:
+          description: "Estimated beta of RP fund to equity index"
+    macro:
+      provider: "Haver/BEA/Treasury"
+      fields:
+        us_tsy_net_issuance:
+          description: "Treasury net issuance (incl. bills), 3mma"
+        fed_purchases:
+          description: "Fed QE purchases, 3mma"
+        foreign_net_flows:
+          description: "Net foreign flows into US bonds, 12m sum"
+        pension_funding_ratio:
+          description: "Estimated DB pension funding ratio"
+    yields:
+      provider: "Bloomberg"
+      fields:
+        ust10y:
+          bloomberg: "USGG10YR Index"
+        bund10y:
+          bloomberg: "GDBR10 Index"
+
+  preprocessing:
+    frequency:
+      - "weekly (CFTC, EPFR)"
+      - "monthly (macro flows, foreign flows, pensions)"
+    missing_data:
+      policy: "Forward-fill by category within a max gap of 4 weeks."
+    normalization:
+      positioning_to_oi:
+        formula: "pos_pct_oi = net_position / open_interest"
+        unit: "%_of_OI"
+
+  metrics:
+    - id: "spec_bond_fut_position"
+      name: "Speculative Bond Futures Positioning"
+      description: >
+        Aggregate net non-commercial and leveraged positions in 10y
+        equivalent DV01, scaled by open interest, matching the charts in the
+        Rising Rates report (Figure 3-4).
+      inputs:
+        - net_noncommercial
+        - net_leveraged
+        - open_interest
+        - contract_duration
+      computation:
+        steps:
+          - name: "10y_equiv"
+            formula: "DV01_10y_eq = contracts * contract_duration / 10"
+          - name: "Net_agg"
+            formula: "Net_spec = net_noncommercial + net_leveraged"
+          - name: "Pct_OI"
+            formula: "Spec_pos_pct_oi(t) = Net_spec(t) / open_interest(t)"
+      output:
+        unit: "%_of_OI"
+        rounding: 1
+
+    - id: "cta_bond_momentum_signal"
+      name: "CTA Bond 1Y Momentum Signal"
+      description: >
+        1-year price momentum signal on 10y bonds per CTA methodology,
+        rescaled to z-scores as shown in the research.
+      inputs:
+        - ust10y
+        - bund10y
+      computation:
+        steps:
+          - name: "Total_return"
+            formula: >
+              TR_10y(t) = price(t) + accrued_interest(t) with constant-duration
+              approximation.
+          - name: "Mom_1y"
+            formula: "Mom_1y(t) = TR_10y(t) / TR_10y(t-252) - 1"
+          - name: "Z_score"
+            formula: >
+              CTA_mom_z(t) = (Mom_1y(t) - mean(Mom_1y[t-1260..t-1])) /
+                             std(Mom_1y[t-1260..t-1])
+      output:
+        unit: "z_score"
+        rounding: 2
+
+    - id: "cta_bond_allocation"
+      name: "CTA Overall Bond Allocation"
+      description: >
+        Estimated allocation of CTA trend-following strategies to the bond
+        bucket, expressed as percentile versus history (Figure 6, 11, 45).
+      inputs:
+        - cta_bond_momentum_signal
+      computation:
+        steps:
+          - name: "Map_mom_to_weight"
+            formula: >
+              CTA_weight_raw(t) = clip( 0.5 + k * CTA_mom_z(t), 0, 1 )
+              where k is calibrated from backtest.
+          - name: "Percentile"
+            formula: >
+              CTA_weight_pctile(t) = percentile_rank(CTA_weight_raw, window=5y)
+      output:
+        fields:
+          weight:
+            type: "float"
+            unit: "%_allocation"
+          percentile_since_2010:
+            type: "float"
+            unit: "%"
+
+    - id: "risk_parity_bond_beta"
+      name: "Risk Parity Bond Exposure"
+      description: >
+        Beta of risk parity benchmarks to US Treasuries, used as a proxy for
+        bond exposure and leverage (Figure 11).
+      inputs:
+        - rp_beta_to_bonds
+      computation:
+        steps:
+          - name: "7d_smooth"
+            formula: >
+              RP_beta_smooth(t) = mean(rp_beta_to_bonds[t-6..t])
+      output:
+        unit: "beta"
+        rounding: 2
+
+    - id: "risk_parity_equity_beta"
+      name: "Risk Parity Equity Exposure"
+      description: "Beta of risk parity benchmarks to S&P 500."
+      inputs:
+        - rp_beta_to_equity
+      computation:
+        steps:
+          - name: "7d_smooth"
+            formula: "RP_equity_beta_smooth(t) = mean(rp_beta_to_equity[t-6..t])"
+      output:
+        unit: "beta"
+        rounding: 2
+
+    - id: "foreign_bond_flows_ratio_gdp"
+      name: "Foreign Flows into US Bonds (% of GDP, 12m Sum)"
+      description: >
+        12-month sum of net foreign flows into US bonds, scaled by nominal
+        GDP, reproducing Figures 2, 17, 18 in the report.
+      inputs:
+        - foreign_net_flows
+        - nominal_gdp
+      computation:
+        steps:
+          - name: "Twelve_month_sum"
+            formula: "Flows_12m(t) = sum_{k=0..11} foreign_net_flows(t-30k)"
+          - name: "Ratio_to_gdp"
+            formula: "Flows_12m_pct_gdp(t) = Flows_12m(t) / nominal_gdp(t)"
+      output:
+        unit: "%_of_GDP"
+        rounding: 2
+
+    - id: "pension_duration_demand"
+      name: "Pension Duration Demand Estimate"
+      description: >
+        Estimated quarterly demand for long-duration fixed income from US
+        pensions, based on funding ratio and equity performance.
+      inputs:
+        - pension_funding_ratio
+        - equity_index_return
+      computation:
+        steps:
+          - name: "Funding_change"
+            formula: >
+              dFund(t) = pension_funding_ratio(t) - pension_funding_ratio(t-90)
+          - name: "Demand_proxy"
+            formula: >
+              Pension_dur_demand(t) = max(0, target_allocation - actual_allocation)
+              proxied by function f(dFund, equity_index_return).
+      output:
+        unit: "USD_bn_equiv"
+        rounding: 1
+      edge_cases:
+        - condition: "missing_funding_ratio"
+          action: "set metric to null"
+
+    - id: "bond_fund_flows_weekly"
+      name: "Weekly Bond Fund Flows"
+      description: "Weekly flows into bond funds and ETFs."
+      inputs:
+        - bond_funds
+      computation:
+        steps:
+          - name: "Level"
+            formula: "Bond_flows_wk(t) = bond_funds(t)"
+      output:
+        unit: "USD_bn"
+        rounding: 1
+
+    - id: "bond_fund_flows_4w"
+      name: "4-Week Bond Fund Flows"
+      description: "4-week cumulative bond fund flows."
+      inputs:
+        - bond_funds
+      computation:
+        steps:
+          - name: "Sum_4w"
+            formula: "Bond_flows_4w(t) = sum_{k=0..3} bond_funds(t-7k)"
+      output:
+        unit: "USD_bn"
+        rounding: 1
+
+  reporting:
+    standard_charts:
+      - id: "cta_and_rp_bond_exposure"
+        metrics:
+          - "cta_bond_allocation"
+          - "risk_parity_bond_beta"
+        frequency: "weekly"
+      - id: "spec_futures_vs_yields"
+        metrics:
+          - "spec_bond_fut_position"
+          - "ust10y"
+        frequency: "weekly"
+      - id: "foreign_flows_panel"
+        metrics:
+          - "foreign_bond_flows_ratio_gdp"
+        frequency: "monthly"
+      - id: "bond_fund_flows_panel"
+        metrics:
+          - "bond_fund_flows_weekly"
+          - "bond_fund_flows_4w"
+        frequency: "weekly"
+
+  sla:
+    refresh_frequency: "Weekly"
+    data_cutoff_time: "T+1 12:00 UTC"
+    pipeline_completion_target: "T+1 18:00 UTC"
+
+  audit_and_lineage:
+    lineage_tracking:
+      enabled: true
+      granularity: "metric-date"

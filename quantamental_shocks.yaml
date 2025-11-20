@@ -1,0 +1,176 @@
+
+quantamental_shocks_spec:
+  version: "1.0.0"
+  owner:
+    team: "Rates Quantamental Strategy"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+  description: >
+    Specification for measuring market reaction to macro data surprises,
+    particularly inflation (CPI) shocks, as described in 'When shocks no longer
+    shock'. Outputs include release-day vol vs normal vol, surprise magnitudes,
+    and regime diagnostics.
+
+  universe_definition:
+    scope: "US Treasury curve, CPI releases"
+    inclusion_rules:
+      - "Include 10y and 30y UST yields."
+      - "Include all monthly US CPI releases since 1990."
+    identity_keys:
+      release_date: "YYYY-MM-DD"
+      maturity:
+        - "10y"
+        - "30y"
+
+  data_sources:
+    macro:
+      provider: "Bloomberg/Consensus Economics"
+      fields:
+        cpi_actual:
+          description: "Headline CPI year-on-year, release value"
+        cpi_consensus:
+          description: "Median survey expectation"
+    rates:
+      provider: "Bloomberg"
+      fields:
+        ust10y:
+          description: "10y Treasury yield (close)"
+        ust30y:
+          description: "30y Treasury yield (close)"
+
+  preprocessing:
+    frequency:
+      - "daily (yields)"
+      - "monthly (CPI)"
+    missing_data:
+      policy: "No interpolation on releases; skip release if any core field missing."
+    business_day_alignment:
+      policy: >
+        Use closing yields on CPI release day and prior business day for changes.
+        For non-release vol, use all business days.
+
+  metrics:
+    - id: "cpi_surprise"
+      name: "CPI Surprise (Actual - Consensus)"
+      description: >
+        Difference between realised CPI and consensus expectation, basis
+        points and standardised by historical forecast error.
+      inputs:
+        - cpi_actual
+        - cpi_consensus
+      computation:
+        steps:
+          - name: "Raw_surprise"
+            formula: "CPI_surprise_raw(d) = cpi_actual(d) - cpi_consensus(d)"
+          - name: "Z_score"
+            formula: >
+              CPI_surprise_z(d) = (CPI_surprise_raw(d) -
+              mean(CPI_surprise_raw[d-10y..d-1])) /
+              std(CPI_surprise_raw[d-10y..d-1])
+      output:
+        fields:
+          surprise_raw:
+            type: "float"
+            unit: "percentage_points"
+          surprise_z:
+            type: "float"
+            unit: "z_score"
+
+    - id: "release_day_vol"
+      name: "Release-Day Yield Volatility"
+      description: >
+        Realised volatility of daily changes in yields on CPI release dates,
+        computed over a rolling 5-year window with exponential weighting.
+      inputs:
+        - ust10y
+        - ust30y
+        - release_flag
+      computation:
+        steps:
+          - name: "Daily_changes"
+            formula: >
+              dY_10(t) = ust10y(t) - ust10y(t-1);
+              dY_30(t) = ust30y(t) - ust30y(t-1)
+          - name: "Exp_weighted_std_release"
+            formula: >
+              sigma_release_10y(d) = EW_STD(dY_10 | CPI_release_days, window=5y, half_life=1y)
+              sigma_release_30y(d) = EW_STD(dY_30 | CPI_release_days, window=5y, half_life=1y)
+      output:
+        unit: "basis_points"
+        rounding: 2
+
+    - id: "normal_day_vol"
+      name: "Non-Release-Day Yield Volatility"
+      description: "Same as release-day vol but for all other days."
+      inputs:
+        - ust10y
+        - ust30y
+        - release_flag
+      computation:
+        steps:
+          - name: "Exp_weighted_std_nonrelease"
+            formula: >
+              sigma_normal_10y(d) = EW_STD(dY_10 | non_release_days, window=5y, half_life=1y)
+              sigma_normal_30y(d) = EW_STD(dY_30 | non_release_days, window=5y, half_life=1y)
+      output:
+        unit: "basis_points"
+        rounding: 2
+
+    - id: "release_vs_normal_vol_ratio"
+      name: "Release vs Normal Volatility Ratio"
+      description: >
+        Ratio of release-day volatility to normal volatility (Figure 2-style
+        charts showing how CPI event sensitivity has fallen since QE).
+      inputs:
+        - release_day_vol
+        - normal_day_vol
+      computation:
+        steps:
+          - name: "Ratio"
+            formula: >
+              Vol_ratio_10y(d) = sigma_release_10y(d) / sigma_normal_10y(d)
+              Vol_ratio_30y(d) = sigma_release_30y(d) / sigma_normal_30y(d)
+      output:
+        unit: "ratio"
+        rounding: 2
+
+    - id: "large_surprise_flag"
+      name: "Large CPI Surprise Flag"
+      description: >
+        Indicates whether a CPI release belongs to the top decile of positive
+        surprises or bottom decile of negative surprises.
+      inputs:
+        - cpi_surprise
+      computation:
+        steps:
+          - name: "Quantiles"
+            formula: >
+              q90 = quantile(CPI_surprise_raw, 0.9 over rolling 10y)
+              q10 = quantile(CPI_surprise_raw, 0.1 over rolling 10y)
+          - name: "Flag"
+            formula: >
+              Large_pos_flag(d) = 1 if CPI_surprise_raw(d) >= q90
+              Large_neg_flag(d) = 1 if CPI_surprise_raw(d) <= q10
+      output:
+        fields:
+          large_pos_flag:
+            type: "int"
+          large_neg_flag:
+            type: "int"
+
+  reporting:
+    standard_charts:
+      - id: "vol_ratio_panel"
+        metrics:
+          - "release_vs_normal_vol_ratio"
+        frequency: "monthly"
+      - id: "cpi_surprise_panel"
+        metrics:
+          - "cpi_surprise"
+          - "large_surprise_flag"
+        frequency: "monthly"
+
+  sla:
+    refresh_frequency: "Monthly (on CPI release)"
+    data_cutoff_time: "Release_day 18:00 ET"
+    pipeline_completion_target: "Release_day 22:00 ET"

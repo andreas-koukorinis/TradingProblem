@@ -1,0 +1,159 @@
+
+em_credit_strategy_curve_basis_spec:
+  version: "1.0.0"
+  owner:
+    team: "EM Credit Strategy"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+  description: >
+    Specification for EM sovereign CDS-bond basis and curve slope signals
+    used in 'Retracing some of the recent moves in basis and curves'. The
+    system computes basis, curve slopes, z-scores, and RV trade signals
+    such as 5Y CDS vs 30Y bonds and 29s/49s curve steepeners.
+
+  universe_definition:
+    scope: "EM USD sovereign curves and CDS"
+    inclusion_rules:
+      - "Include EM sovereigns with liquid 5Y CDS and at least two USD benchmarks."
+    identity_keys:
+      issuer: "ISO_3"
+      bond_id: "ISIN"
+      cds_tenor:
+        - "5Y"
+      curve_points:
+        - "5Y"
+        - "10Y"
+        - "30Y"
+
+  data_sources:
+    bonds:
+      provider: "Bloomberg"
+      fields:
+        yield_to_maturity:
+          bloomberg: "YLD_YTM_MID"
+        libor_ois_curve:
+          description: "USD Libor/OIS curve for spread computation"
+    cds:
+      provider: "Markit"
+      fields:
+        cds_spread_5y:
+          description: "5Y USD sovereign CDS, mid"
+    curves_metadata:
+      provider: "Internal"
+      fields:
+        benchmark_map:
+          description: "Mapping issuer to on-the-run 5Y, 10Y, 30Y bonds"
+
+  preprocessing:
+    frequency:
+      - "daily"
+    spread_calculation:
+      formula: >
+        Bond_ASW_spread(bond) = ASW(bond vs Libor/OIS) in bp
+    tenors:
+      mapping:
+        "5Y": "benchmark_24-32 maturity bucket"
+        "10Y": "benchmark_8-12 years"
+        "30Y": "longest point, >20 years"
+
+  metrics:
+    - id: "cds_bond_basis_5y"
+      name: "5Y CDS-Bond Basis"
+      description: >
+        Difference between 5Y CDS spread and 5Y cash ASW spread for an
+        issuer, in bp. Negative basis indicates bonds are cheap vs CDS.
+      inputs:
+        - cds_spread_5y
+        - bond_asw_5y
+      computation:
+        steps:
+          - name: "Basis"
+            formula: "Basis_5y(t, i) = cds_spread_5y(t, i) - bond_asw_5y(t, i)"
+      output:
+        unit: "basis_points"
+        rounding: 1
+
+    - id: "curve_slope_10s30s"
+      name: "10s30s Curve Slope (Libor OIS Spread)"
+      description: "Difference between 30Y and 10Y cash spreads."
+      inputs:
+        - bond_asw_10y
+        - bond_asw_30y
+      computation:
+        steps:
+          - name: "Slope"
+            formula: "Slope_10s30s(t, i) = bond_asw_30y(t, i) - bond_asw_10y(t, i)"
+      output:
+        unit: "basis_points"
+        rounding: 1
+
+    - id: "basis_zscore"
+      name: "Basis Z-Score"
+      description: "Rolling z-score of 5Y basis vs issuer's own history."
+      inputs:
+        - cds_bond_basis_5y
+      computation:
+        steps:
+          - name: "Z"
+            formula: >
+              Basis_z(t, i) = (Basis_5y(t, i) - mean(Basis_5y[t-252..t-1, i])) /
+                             std(Basis_5y[t-252..t-1, i])
+      output:
+        unit: "z_score"
+        rounding: 2
+
+    - id: "curve_slope_zscore"
+      name: "10s30s Slope Z-Score"
+      description: "Rolling z-score for curve slope."
+      inputs:
+        - curve_slope_10s30s
+      computation:
+        steps:
+          - name: "Z"
+            formula: >
+              Slope_z(t, i) = (Slope_10s30s(t, i) - mean(Slope_10s30s[t-252..t-1, i])) /
+                              std(Slope_10s30s[t-252..t-1, i])
+      output:
+        unit: "z_score"
+        rounding: 2
+
+    - id: "rv_trade_signal_brazil_5y_vs_50s"
+      name: "Brazil 5Y CDS vs 2050 Bond RV Score"
+      description: >
+        DV01-neutral spread difference between Brazil 5Y CDS and Brazil
+        2050 bond ASW spread, as in the note's example trade.
+      inputs:
+        - cds_spread_5y
+        - bond_asw_50
+        - dv01_cds_5y
+        - dv01_bond_50
+      computation:
+        steps:
+          - name: "Spread_diff"
+            formula: "Diff_raw(t) = cds_spread_5y(t, BRL) - bond_asw_50(t, BRL)"
+          - name: "DV01_neutral_scale"
+            formula: >
+              Notional_ratio = dv01_cds_5y / dv01_bond_50
+          - name: "RV_score"
+            formula: "RV_score(t) = Diff_raw(t)  # direct, DV01 scaling used in sizing"
+      output:
+        unit: "basis_points"
+        rounding: 1
+
+  reporting:
+    standard_charts:
+      - id: "basis_histories"
+        metrics:
+          - "cds_bond_basis_5y"
+          - "basis_zscore"
+        frequency: "daily"
+      - id: "curve_slopes_histories"
+        metrics:
+          - "curve_slope_10s30s"
+          - "curve_slope_zscore"
+        frequency: "daily"
+
+  sla:
+    refresh_frequency: "Daily"
+    data_cutoff_time: "T+0 20:00 UTC"
+    pipeline_completion_target: "T+1 05:00 UTC"
