@@ -1,0 +1,294 @@
+pnl_decomposition_spec:
+  version: "1.0.0"
+  owner:
+    team: "Credit Quant / Systematic FI"
+    product_manager: "TBD"
+    tech_owner: "TBD"
+  description: >
+    Unified P&L decomposition schema for Corporate Bonds, Fixed-Income ETFs,
+    and CDS. Structured into three hierarchical levels:
+    (1) P&L Category, (2) Top-Level Factor, (3) Detailed Sub-Factor.
+    Each factor includes definition, asset-class applicability, inputs,
+    units, sign convention, and computation methodology based on the
+    hybrid approach: sensitivities-times-move for market factors,
+    revaluation differences for ETF NAV/CR-DR/basis, and exact formulas
+    for jump-to-default and corporate actions. Pricing libraries are
+    external (Option A).
+
+  methodology:
+    pricing_stack: "External — not defined in YAML"
+    pnl_approach: "Hybrid"
+    pnl_rules:
+      - "Market factors (spreads, rates): Sensitivity × MarketMove"
+      - "ETF prem/disc, create-redeem, bond–CDS basis: Revaluation ΔPV"
+      - "Corporate actions, calls, tenders: Revaluation ΔPV"
+      - "CDS JTD: Exact jump formula"
+      - "Liquidity p&l: Mid-change × position + bid/ask drift"
+      - "Trading P&L: ExecutedPrice - TheoreticalEntryPrice"
+
+  asset_classes:
+    - "corporate_bond"
+    - "fixed_income_etf"
+    - "cds"
+
+  units_conventions:
+    dv01: "USD per 1bp parallel risk-free curve move"
+    cs01: "USD per 1bp asset-specific spread move"
+    pv01: "USD per 1bp CDS spread move"
+    spread: "Basis points"
+    yield: "Percent"
+    premium_discount: "Percent difference vs NAV"
+    position: "Face value or notional (USD)"
+    pnl: "USD"
+    sign_convention: >
+      Positive P&L means profit. Market-move direction is defined from
+      the perspective of a long-credit-risk/long-duration position
+      (spread tightening positive; yield/rate decrease positive).
+
+  ###################################################################
+  # 1. RATES CATEGORY
+  ###################################################################
+  categories:
+    rates:
+      description: "P&L driven by movements in the risk-free curve."
+      applicable_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+      top_level_factors:
+
+        dv01_effect:
+          definition: "Impact of parallel risk-free curve shifts."
+          method: "DV01 × ΔRiskFreeYield"
+          inputs:
+            - "risk_free_curve_t-1"
+            - "risk_free_curve_t"
+            - "instrument_dv01"
+          detailed_factors:
+
+            parallel_rate_move:
+              definition: "DV01 × (Δswap_rate or ΔUST rate)"
+              units: "USD"
+              sign: "Long duration gains when yields fall."
+              applies_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+            key_rate_bucketing:
+              definition: "Sum_i (KRD_i × ΔRate_i)"
+              inputs:
+                - "key_rate_durations: 2y,5y,10y,30y"
+                - "key_rate_changes"
+              applies_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+        convexity_effect:
+          definition: "Second-order rate impact due to curvature."
+          method: "0.5 × Convexity × (Δyield)^2"
+          applies_to: ["corporate_bond", "fixed_income_etf"]
+          detailed_factors:
+            rate_gamma:
+              definition: "Nonlinear rate component."
+              inputs: ["duration", "convexity"]
+
+  ###################################################################
+  # 2. CREDIT CATEGORY
+  ###################################################################
+    credit:
+      description: "Effects linked to spread movements and credit quality."
+      applicable_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+      top_level_factors:
+
+        spread_delta:
+          definition: "First-order credit spread impact."
+          method: "CS01 × ΔSpread (bonds/ETFs), PV01 × ΔSpread (CDS)"
+          applies_to: ["corporate_bond", "fixed_income_etf", "cds"]
+          detailed_factors:
+
+            cs01_parallel:
+              definition: "Parallel credit-spread impact."
+              inputs:
+                - "cs01"
+                - "spread_t"
+                - "spread_t-1"
+              units: "USD"
+
+            term_structure_moves:
+              definition: "Bucketed spread curve moves (1–3y, 3–5y, 5–10y)."
+              inputs:
+                - "bucketed_spread_changes"
+                - "bucketed_cs01"
+
+        spread_gamma:
+          definition: "Second-order spread convexity."
+          method: "0.5 × SpreadConvexity × (Δspread)^2"
+          applies_to: ["corporate_bond"]
+
+        roll_down:
+          definition: >
+            Expected P&L from time-decay movement down the spread/rate curve.
+          method: "Roll-down = YieldChange_due_to_maturity_roll × Duration"
+          applies_to: ["corporate_bond"]
+
+        rating_migration:
+          definition: "P&L impact from rating upgrades/downgrades."
+          method: "Revaluation using new spread curve of rating bucket."
+          applies_to: ["corporate_bond"]
+
+  ###################################################################
+  # 3. LIQUIDITY & MICROSTRUCTURE CATEGORY
+  ###################################################################
+    liquidity:
+      description: "Liquidity-driven P&L from bid/ask, TRACE/SEF microstructure."
+      applicable_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+      top_level_factors:
+
+        bid_ask_drift:
+          definition: "Change in mid/bid/ask independent of fundamentals."
+          method: "ΔMid × position + change_in_bidask × position"
+          detailed_factors:
+            mid_move:
+              definition: "Mid-price drift unrelated to curves."
+              inputs:
+                - "mid_t"
+                - "mid_t-1"
+            spread_widening:
+              definition: "Bid/ask widening."
+              inputs:
+                - "bidask_width_t"
+                - "bidask_width_t-1"
+
+        trade_slippage:
+          definition: "Trading friction from execution vs mid."
+          method: "(ExecutionPrice - MidPrice) × direction × size"
+          applies_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+  ###################################################################
+  # 4. ETF STRUCTURAL CATEGORY
+  ###################################################################
+    etf_structural:
+      description: "ETF-specific structural effects."
+      applicable_to: ["fixed_income_etf"]
+
+      top_level_factors:
+
+        premium_discount_realization:
+          definition: "Realized NAV-premium mean reversion."
+          method: "(ETF_Price - NAV)_t - (ETF_Price - NAV)_{t-1}"
+          detailed_factors:
+            nav_mispricing:
+              inputs: ["nav_t", "nav_t-1", "price_t", "price_t-1"]
+
+        primary_market_cr_dr:
+          definition: "Create/redeem P&L linked to basket differences."
+          method: "ΔPV(basket) + fees + liquidity slippage"
+          detailed_factors:
+            basket_substitution:
+              definition: "Difference between provided basket and theoretical NAV basket."
+              inputs:
+                - "provided_basket"
+                - "theoretical_basket"
+            cash_in_lieu:
+              definition: "Cash substitutions vs bond deliveries."
+
+        index_rebalancing:
+          definition: "Index add/delete and weight-change P&L."
+          method: "Revalue holdings at new index weights."
+
+  ###################################################################
+  # 5. CDS-SPECIFIC CATEGORY
+  ###################################################################
+    cds_structural:
+      description: "CDS-specific structural effects."
+      applicable_to: ["cds"]
+
+      top_level_factors:
+
+        jump_to_default:
+          definition: "Jump-to-default P&L at credit event."
+          method: "LGD × notional (protection seller loses; buyer gains)"
+          inputs:
+            - "notional"
+            - "recovery_assumption"
+
+        curve_roll:
+          definition: "Maturity-roll effect as CDS ages."
+          method: "PV(t-1 maturity curve) - PV(t maturity curve)"
+          detailed_factors:
+            pv_change:
+              inputs: ["pv_t", "pv_t-1"]
+
+        cds_basis:
+          definition: "Bond–CDS basis convergence/divergence."
+          method: "Δ(bond_spread - cds_spread) × hedge_ratio"
+          applies_to: ["cds", "corporate_bond"]
+
+  ###################################################################
+  # 6. CARRY & ACCRUAL CATEGORY
+  ###################################################################
+    carry_accrual:
+      description: "Carry, accrual, coupon and financing effects."
+      applicable_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+      top_level_factors:
+
+        coupon_accrual:
+          definition: "Daily coupon accrual on bonds/ETF underlying."
+          method: "AccruedCoupon_t - AccruedCoupon_{t-1}"
+          applies_to: ["corporate_bond", "fixed_income_etf"]
+
+        cds_premium_accrual:
+          definition: "Accrual of CDS premium leg."
+          method: "AccruedPremium_t - AccruedPremium_{t-1}"
+          applies_to: ["cds"]
+
+        fx_carry:
+          definition: "Carry from FX hedging or unhedged exposures."
+          method: "ForwardPoints × notional"
+          applies_to: ["corporate_bond", "fixed_income_etf"]
+
+  ###################################################################
+  # 7. CORPORATE-ACTION CATEGORY
+  ###################################################################
+    corporate_actions:
+      description: "Bonds affected by calls, tenders, exchanges."
+      applicable_to: ["corporate_bond", "fixed_income_etf"]
+
+      top_level_factors:
+
+        call_event:
+          definition: "Impact of issuer call."
+          method: "Revalue at call price vs market price."
+          inputs:
+            - "call_price"
+            - "market_price"
+
+        tender_offer:
+          definition: "Impact from tender premium or discount."
+          method: "TenderPrice - MarketPrice"
+
+        exchange_offer:
+          definition: "PV(new instrument) - PV(old instrument)"
+
+  ###################################################################
+  # 8. TRADING ACTIVITY CATEGORY
+  ###################################################################
+    trading_activity:
+      description: "P&L from new trades, executions, inventory changes."
+      applicable_to: ["corporate_bond", "fixed_income_etf", "cds"]
+
+      top_level_factors:
+
+        new_trade_pnl:
+          definition: "Difference between executed price and model price."
+          method: "(ExecutedPrice - TheoreticalPrice) × direction × size"
+
+        inventory_transfer:
+          definition: "Desk-to-desk transfer pricing effects."
+          method: "TransferPrice - TheoreticalPrice"
+
+  ###################################################################
+  # 9. RESIDUAL CATEGORY
+  ###################################################################
+    residual:
+      description: >
+        Residual unexplained P&L after summing all defined factors.
+        Should be minimized but not forced to zero.
+      method: "Residual = TotalPnL - SumOfAllExplainedFactors"
