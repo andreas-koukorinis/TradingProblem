@@ -1,0 +1,19 @@
+need to be able to run scenarios	
+need to be able to run risk analysis for a dynamic aggregation of positions	
+for stress testing, need a way to go from a set of assumptions about the state of the world to a vector of likely market prices to use to re-price the portfolio	
+	Question: easy to use a correlation matrix if change one security price, but what if want multiple simultaneous security price changes?
+	
+calcs we need to be able to do:	
+	CS01 (credit spread sensitivity for 1 bps move in spreads- same as DV01)
+	CS10pct (CS01* 10%* underlying spread- proportional risk measure)
+	J-t-D (jump to default for a current recovery assumption)
+	1m, 3m 01 (average daily spread vol for the last 1mo, or last 3mo * the CS01= equivelant to a realized vol measure but for credit)
+	Notional Exposure
+	Carry/Roll
+	Bucket Exposures (summing the risk per bucket of spreads, per bucket of tenor, per industry etc)
+	Single Name exposure across all strategies (how much of all the above you have per name across strategies)
+	The risk outlines MW has put together for each strategy (E2C, L/S etc)-this requires cross asset risk
+	Beta Equivalent risk per name, per bucket, per currency- using SPX, HY,XOver, IG and MAIN
+	BB01 (basis 01, for trades that are long /short derivatives versus short/long cash position)
+	Basic Option Greeks for both rates and equities
+	Basic Rate risk (I will leave Mary to sum up what she wants, for me its really per term/tenor DV01 and swap spread risk risk  (risk in bond vs swap risk)
